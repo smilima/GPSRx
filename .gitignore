@@ -1,69 +1,50 @@
-# Prerequisites
-*.d
+# ---- RAD Studio / C++Builder build output ----
+/Win32/
+/Win64/
+/Win64x/
+/Android/
+/Android64/
+/OSX64/
+/OSXARM64/
+/Linux64/
+/iOSDevice64/
 
-# Compiled Object files
-*.slo
-*.lo
+# ---- RAD Studio history / recovery / autosave ----
+__history/
+__recovery/
+*.~*
+*.@@@
+*.twopts
+*.dsk
+*.tvsconfig
+*.skincfg
+
+# ---- IDE local / per-user project files ----
+*.local
+*.identcache
+*.projdata
+
+# ---- Compiled / generated artifacts ----
+*.exe
+*.dll
+*.bpl
+*.bpi
+*.lib
+*.a
 *.o
 *.obj
-
-# Precompiled Headers
-*.gch
 *.pch
+*.tds
+*.map
+*.drc
+*.rsm
+*.il?
+*.#*
 
-# Linker files
-*.ilk
+# ---- Large GPS IF sample captures (gigabytes; not distributed via GitHub) ----
+*.bin
+*.sim
 
-# Debugger Files
-*.pdb
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-*.so.*
-
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-
-# Build directories
-build/
-Build/
-build-*/
-
-# CMake generated files
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
-install_manifest.txt
-compile_commands.json
-
-# Temporary files
-*.tmp
-*.log
-*.bak
-*.swp
-
-# vcpkg
-vcpkg_installed/
-
-# debug information files
-*.dwo
-
-# test output & cache
-Testing/
-.cache/
+# ---- OS cruft ----
+Thumbs.db
+.DS_Store
