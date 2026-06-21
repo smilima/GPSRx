@@ -173,6 +173,7 @@ private:	// User declarations
 	void __fastcall advDone(TObject* Sender);          // Analyze worker OnTerminate
 	void __fastcall inspectorClose(TObject* Sender, TCloseAction& Action);
 	TForm* makeInspector(const String& title, int w, int h);
+	void   dpiShow(TForm* f);   // DPI-scale a runtime popup's subtree, then Show()
 	const AdvPrn* advFind(int prn) const;
 	void advFillPrnCombo(TComboBox* cb, bool ephemerisOnly);
 	void __fastcall advCodeClick(TObject* Sender);     // C/A code & correlation

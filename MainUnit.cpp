@@ -31,6 +31,55 @@
 TMainForm *MainForm;
 
 //---------------------------------------------------------------------------
+// DPI scaling for runtime-created controls.
+//
+// The app is PerMonitorV2 DPI-aware and the form is Scaled, so VCL scales the
+// .dfm-streamed controls (and fonts) from the 96-DPI design to the monitor DPI.
+// But controls we create in code and place with literal SetBounds() pixels are
+// NOT auto-scaled - they keep their 96-DPI coordinates while inheriting the
+// already-scaled font, so on a 1.5x display their boxes are too small for the
+// text. dpx() scales a design pixel to the current screen DPI; runtime popup
+// forms (born at 96 DPI) are instead scaled wholesale via TForm::ScaleForPPI in
+// dpiShow(), which is exactly what VCL does for designed forms.
+//---------------------------------------------------------------------------
+static int dpx(int v)
+{
+    return (int)((long long)v * Vcl::Forms::Screen->PixelsPerInch / 96);
+}
+
+//---------------------------------------------------------------------------
+// Recursively scale a runtime popup's child controls from 96-DPI design
+// coordinates to the current screen DPI. We scale ONLY geometry (bounds, and
+// grid column/row sizes) - NOT fonts: a runtime form's fonts already render at
+// the device DPI (points are physical), so scaling them too would double up.
+// Anchors are pinned to top-left during each move so SetBounds is absolute and
+// akRight/akBottom children land correctly, then restored for live resizing.
+// The form itself is pre-sized with dpx() in makeInspector.
+static void scaleChildrenForDpi(Vcl::Controls::TWinControl* parent)
+{
+    const int num = Vcl::Forms::Screen->PixelsPerInch, den = 96;
+    if (num == den) return;
+    for (int i = 0; i < parent->ControlCount; ++i) {
+        Vcl::Controls::TControl* c = parent->Controls[i];
+        TAnchors keep = c->Anchors;
+        c->Anchors = TAnchors() << akLeft << akTop;
+        c->SetBounds(MulDiv(c->Left, num, den), MulDiv(c->Top, num, den),
+                     MulDiv(c->Width, num, den), MulDiv(c->Height, num, den));
+        c->Anchors = keep;
+        if (c->InheritsFrom(__classid(TStringGrid))) {
+            TStringGrid* g = static_cast<TStringGrid*>(c);
+            g->DefaultRowHeight = MulDiv(g->DefaultRowHeight, num, den);
+            // Scale each column's effective width. NB: do NOT set DefaultColWidth
+            // here - that resets explicit per-column widths to a uniform value.
+            for (int col = 0; col < g->ColCount; ++col)
+                g->ColWidths[col] = MulDiv(g->ColWidths[col], num, den);
+        }
+        if (c->InheritsFrom(__classid(Vcl::Controls::TWinControl)))
+            scaleChildrenForDpi(static_cast<Vcl::Controls::TWinControl*>(c));
+    }
+}
+
+//---------------------------------------------------------------------------
 // Acquisition config from the file name.
 //
 // Our captures encode their sample rate / IF in the file name, e.g.
@@ -222,7 +271,7 @@ __fastcall TMainForm::TMainForm(TComponent* Owner)
     FbtnStream = new TButton(this);
     FbtnStream->Parent  = Panel1;
     FbtnStream->Caption = L"Stream from DAC";
-    FbtnStream->SetBounds(editFile->Left + editFile->Width + 12, editFile->Top - 2, 130, 27);
+    FbtnStream->SetBounds(editFile->Left + editFile->Width + dpx(12), editFile->Top - dpx(2), dpx(130), dpx(27));
     FbtnStream->OnClick = btnStreamClick;
 
     // --- Advanced inspection: "Advanced" checkbox + a hidden tab of inspectors ---
@@ -230,7 +279,7 @@ __fastcall TMainForm::TMainForm(TComponent* Owner)
     FchkAdvanced = new TCheckBox(this);
     FchkAdvanced->Parent  = Panel1;
     FchkAdvanced->Caption = L"Advanced";
-    FchkAdvanced->SetBounds(FbtnStream->Left + FbtnStream->Width + 16, editFile->Top + 2, 90, 21);
+    FchkAdvanced->SetBounds(FbtnStream->Left + FbtnStream->Width + dpx(16), editFile->Top + dpx(2), dpx(90), dpx(21));
     FchkAdvanced->OnClick = advCheckClick;
 
     tsAdvanced = new TTabSheet(PageControl1);
@@ -240,7 +289,7 @@ __fastcall TMainForm::TMainForm(TComponent* Owner)
 
     FlblAdv = new TLabel(this);
     FlblAdv->Parent = tsAdvanced;
-    FlblAdv->SetBounds(10, 8, 940, 44);
+    FlblAdv->SetBounds(dpx(10), dpx(8), dpx(940), dpx(44));
     FlblAdv->AutoSize = false; FlblAdv->WordWrap = true;
     FlblAdv->Caption =
         L"GPS signal inspection lab - teaching views of every receiver stage.  "
@@ -250,7 +299,7 @@ __fastcall TMainForm::TMainForm(TComponent* Owner)
 
     FbtnAnalyze = new TButton(this);
     FbtnAnalyze->Parent = tsAdvanced;
-    FbtnAnalyze->SetBounds(10, 56, 230, 30);
+    FbtnAnalyze->SetBounds(dpx(10), dpx(56), dpx(230), dpx(30));
     FbtnAnalyze->Caption = L"Analyze (track + decode all)";
     FbtnAnalyze->OnClick = advAnalyzeClick;
 
@@ -261,7 +310,7 @@ __fastcall TMainForm::TMainForm(TComponent* Owner)
         auto add = [&](const String& cap, TNotifyEvent ev, bool needData) {
             TButton* b = new TButton(this);
             b->Parent = tsAdvanced;
-            b->SetBounds(10, 100 + idx * 34, 230, 28);
+            b->SetBounds(dpx(10), dpx(100 + idx * 34), dpx(230), dpx(28));
             b->Caption = cap;
             b->OnClick = ev;
             if (needData) { b->Enabled = false; FAdvButtons.push_back(b); }
@@ -308,8 +357,8 @@ void __fastcall TMainForm::settingsClick(TObject* Sender)
     dlg->Caption      = L"Settings";
     dlg->BorderStyle  = bsDialog;
     dlg->Position     = poMainFormCenter;
-    dlg->ClientWidth  = 340;
-    dlg->ClientHeight = 150;
+    dlg->ClientWidth  = dpx(340);
+    dlg->ClientHeight = dpx(150);
 
     TLabel* l1 = new TLabel(dlg.get());
     l1->Parent = dlg.get(); l1->SetBounds(16, 20, 170, 20); l1->Caption = L"DAC sample rate (Hz)";
@@ -328,6 +377,7 @@ void __fastcall TMainForm::settingsClick(TObject* Sender)
     cancel->Parent = dlg.get(); cancel->Caption = L"Cancel"; cancel->Cancel = true;
     cancel->ModalResult = mrCancel; cancel->SetBounds(240, 106, 80, 28);
 
+    scaleChildrenForDpi(dlg.get());            // scale the runtime dialog geometry
     dlg->ActiveControl = e1;
     if (dlg->ShowModal() == mrOk) {
         double dr = FDacSampleRate, iff = FIfHz;
@@ -547,10 +597,10 @@ void TMainForm::buildTrackingCharts()
     pnl->Parent = tsTracking;
     pnl->Caption = L"";
     pnl->BevelOuter = bvNone;
-    const int gx = sgChannels->Left + sgChannels->Width + 8;
+    const int gx = sgChannels->Left + sgChannels->Width + dpx(8);
     pnl->SetBounds(gx, sgChannels->Top,
-                   tsTracking->ClientWidth  - gx - 6,
-                   tsTracking->ClientHeight - sgChannels->Top - 6);
+                   tsTracking->ClientWidth  - gx - dpx(6),
+                   tsTracking->ClientHeight - sgChannels->Top - dpx(6));
     pnl->Anchors = TAnchors() << akLeft << akTop << akRight << akBottom;
 
     // Top row (upper half): square I/Q constellation on the left, wide Prompt-I
@@ -580,9 +630,9 @@ void TMainForm::buildTrackingCharts()
     TSplitter* spIQ = new TSplitter(this);
     spIQ->Parent  = pnlTop;
     spIQ->Left    = FchIQ->Left + FchIQ->Width;
-    spIQ->Width   = 6;
+    spIQ->Width   = dpx(6);
     spIQ->Align   = alLeft;
-    spIQ->MinSize = 80;
+    spIQ->MinSize = dpx(80);
 
     // Prompt-I over time - the 50 bps nav-bit transitions (wide, fills the row).
     FchPromptI = new TChart(this);
@@ -601,9 +651,9 @@ void TMainForm::buildTrackingCharts()
     TSplitter* spRow = new TSplitter(this);
     spRow->Parent  = pnl;
     spRow->Top     = pnlTop->Top + pnlTop->Height;
-    spRow->Height  = 6;
+    spRow->Height  = dpx(6);
     spRow->Align   = alTop;
-    spRow->MinSize = 80;
+    spRow->MinSize = dpx(80);
 
     // Bottom row (lower half): Doppler (left axis) + C/N0 (right axis) trends,
     // full width; legend BELOW the plot so it does not cover it.
@@ -642,8 +692,8 @@ void TMainForm::buildPositionSky()
     pnlPos->Parent = tsPosition;
     pnlPos->Caption = L"";
     pnlPos->BevelOuter = bvNone;
-    pnlPos->SetBounds(8, sgSats->Top, tsPosition->ClientWidth - 16,
-                      tsPosition->ClientHeight - sgSats->Top - 8);
+    pnlPos->SetBounds(dpx(8), sgSats->Top, tsPosition->ClientWidth - dpx(16),
+                      tsPosition->ClientHeight - sgSats->Top - dpx(8));
     pnlPos->Anchors = TAnchors() << akLeft << akTop << akRight << akBottom;
 
     // Satellite table (left). Re-parented into the container and given the
@@ -651,35 +701,35 @@ void TMainForm::buildPositionSky()
     sgSats->Parent = pnlPos;
     sgSats->Top = 0; sgSats->Left = 0;
     sgSats->Align = alLeft;
-    sgSats->DefaultColWidth = 80;
-    sgSats->ColWidths[0] = 40;
-    sgSats->ColWidths[1] = 64;
-    sgSats->ColWidths[2] = 76;
-    sgSats->ColWidths[3] = 60;
-    sgSats->ColWidths[4] = 130;
+    sgSats->DefaultColWidth = dpx(80);
+    sgSats->ColWidths[0] = dpx(40);
+    sgSats->ColWidths[1] = dpx(64);
+    sgSats->ColWidths[2] = dpx(76);
+    sgSats->ColWidths[3] = dpx(60);
+    sgSats->ColWidths[4] = dpx(130);
 
     // Divider between the table and the summary memo (Left before Align).
     TSplitter* spP1 = new TSplitter(this);
     spP1->Parent  = pnlPos;
     spP1->Left    = sgSats->Width + 1;
-    spP1->Width   = 6;
+    spP1->Width   = dpx(6);
     spP1->Align   = alLeft;
-    spP1->MinSize = 120;
+    spP1->MinSize = dpx(120);
 
     // Fix-summary memo (middle).
     memoFix->Parent = pnlPos;
     memoFix->Top    = 0;
     memoFix->Left   = spP1->Left + spP1->Width + 1;
-    memoFix->Width  = 256;
+    memoFix->Width  = dpx(256);
     memoFix->Align  = alLeft;
 
     // Divider between the memo and the sky plot.
     TSplitter* spP2 = new TSplitter(this);
     spP2->Parent  = pnlPos;
     spP2->Left    = memoFix->Left + memoFix->Width + 1;
-    spP2->Width   = 6;
+    spP2->Width   = dpx(6);
     spP2->Align   = alLeft;
-    spP2->MinSize = 120;
+    spP2->MinSize = dpx(120);
 
     // Sky plot (fills the rest on the right; custom-drawn in FchSkyAfterDraw).
     FchSky = new TChart(this);
@@ -1767,10 +1817,20 @@ TForm* TMainForm::makeInspector(const String& title, int w, int h)
 {
     TForm* f = new TForm(Application);
     f->Caption  = title;
-    f->Width = w; f->Height = h;
+    f->Width = dpx(w); f->Height = dpx(h);   // pre-size the form in scaled pixels
     f->Position = poMainFormCenter;
     f->OnClose  = inspectorClose;
     return f;
+}
+//---------------------------------------------------------------------------
+// Show a runtime-built popup after DPI-scaling its whole control subtree from
+// the 96-DPI design coordinates to the monitor DPI (the popup is born at 96).
+// This is the same scaling VCL applies to .dfm forms, so charts, grids, images
+// and nested panels all scale correctly in one call.
+void TMainForm::dpiShow(TForm* f)
+{
+    scaleChildrenForDpi(f);   // scale child geometry 96 -> screen DPI (fonts already correct)
+    f->Show();
 }
 //---------------------------------------------------------------------------
 const AdvPrn* TMainForm::advFind(int prn) const
@@ -1882,7 +1942,7 @@ void __fastcall TMainForm::advCodeClick(TObject* Sender)
                   L"Auto-correlation is a 1023-high, 1-chip-wide spike = the ~30 dB processing gain that lifts the "
                   L"satellite out of the noise; cross-correlation between PRNs stays low and bounded (CDMA).");
     advCodeChange(NULL);
-    f->Show();
+    dpiShow(f);
 }
 //---------------------------------------------------------------------------
 void __fastcall TMainForm::advCodeChange(TObject* Sender)
@@ -1955,7 +2015,7 @@ void __fastcall TMainForm::advTrackClick(TObject* Sender)
     TFastLineSeries* cn0 = new TFastLineSeries(FtrkObs); FtrkObs->AddSeries(cn0); cn0->Title = L"C/N0"; cn0->VertAxis = aRightAxis;
 
     advTrackChange(NULL);
-    f->Show();
+    dpiShow(f);
 }
 //---------------------------------------------------------------------------
 void __fastcall TMainForm::advTrackChange(TObject* Sender)
@@ -2022,7 +2082,7 @@ void __fastcall TMainForm::advNavClick(TObject* Sender)
     FnavDump->Font->Name = L"Consolas"; FnavDump->Font->Size = 9;
 
     advNavChange(NULL);
-    f->Show();
+    dpiShow(f);
 }
 //---------------------------------------------------------------------------
 void __fastcall TMainForm::advNavChange(TObject* Sender)
@@ -2107,7 +2167,7 @@ void __fastcall TMainForm::advEphClick(TObject* Sender)
     FephMemo->ReadOnly = true; FephMemo->Font->Name = L"Consolas"; FephMemo->Font->Size = 9;
 
     advEphChange(NULL);
-    f->Show();
+    dpiShow(f);
 }
 //---------------------------------------------------------------------------
 void __fastcall TMainForm::advEphChange(TObject* Sender)
@@ -2230,7 +2290,7 @@ void __fastcall TMainForm::advAlmClick(TObject* Sender)
     m->Lines->Add(L"NOTE: the full almanac (all 32 PRNs + iono/UTC) spans the 25-page cycle = 12.5 minutes, so a "
                   L"short capture only shows the few pages it contains - which is why almanac download is slow.");
     m->Lines->EndUpdate();
-    f->Show();
+    dpiShow(f);
 }
 
 //===========================================================================
@@ -2277,7 +2337,7 @@ void __fastcall TMainForm::advPvtClick(TObject* Sender)
     m->Lines->Add(L"satellites are needed. Gauss-Newton least squares solves [x,y,z,clk] from Earth-centre in ~5-6 iters,");
     m->Lines->Add(L"with each SV's clock (af0/1/2 + relativistic - TGD) and the Sagnac earth-rotation correction applied.");
     m->Lines->EndUpdate();
-    f->Show();
+    dpiShow(f);
 }
 
 //===========================================================================
@@ -2356,7 +2416,7 @@ void __fastcall TMainForm::advAcqClick(TObject* Sender)
                   L"A satellite in view shows a sharp 2-D peak (its Doppler + code phase); an absent PRN shows only a flat "
                   L"noise floor. Pick an acquired PRN, then an absent one, to see the difference.");
     advAcqChange(NULL);
-    f->Show();
+    dpiShow(f);
 }
 //---------------------------------------------------------------------------
 void __fastcall TMainForm::advAcqChange(TObject* Sender)
@@ -2485,7 +2545,7 @@ void __fastcall TMainForm::advRfClick(TObject* Sender)
     m->Lines->Add(L"so the spectrum is just band-limited noise with NO visible carrier. That is normal for GPS: the signal");
     m->Lines->Add(L"arrives weaker than the thermal noise. Only the ~30 dB processing gain from despreading (correlating");
     m->Lines->Add(L"against the 1.023 Mcps PRN code) lifts it out - exactly what the Acquisition Surface & C/A Code labs show.");
-    f->Show();
+    dpiShow(f);
 }
 
 //===========================================================================
@@ -2559,6 +2619,6 @@ void __fastcall TMainForm::advJourneyClick(TObject* Sender)
     g->Lines->Add(L"   Sagnac (earth-rotation) correction applied, converges in ~5-6 iterations to an ECEF position -> WGS-84.");
     g->Lines->Add(L"GDOP: geometry dilution of precision - how satellite geometry amplifies range error into position error.");
     g->Lines->EndUpdate();
-    f->Show();
+    dpiShow(f);
 }
 //---------------------------------------------------------------------------
