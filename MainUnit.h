@@ -190,7 +190,7 @@ private:	// User declarations
 	void __fastcall advEphChange(TObject* Sender);
 	void __fastcall advTrackChange(TObject* Sender);
 	void __fastcall advAcqChange(TObject* Sender);
-	bool advReadIF(std::vector<signed char>& out, int maxSamples); // first samples of the capture
+	bool advReadIF(std::vector<std::int8_t>& out, int maxSamples); // first samples of the capture
 public:		// User declarations
 	__fastcall TMainForm(TComponent* Owner);
 	__fastcall ~TMainForm();

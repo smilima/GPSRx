@@ -2344,7 +2344,7 @@ void __fastcall TMainForm::advPvtClick(TObject* Sender)
 // Shared helper: read the first 'maxSamples' int8 IF samples of the open
 // capture (used by the signal-level inspectors that work without "Analyze").
 //===========================================================================
-bool TMainForm::advReadIF(std::vector<signed char>& out, int maxSamples)
+bool TMainForm::advReadIF(std::vector<std::int8_t>& out, int maxSamples)
 {
     out.clear();
     if (FFilePath.IsEmpty() || maxSamples <= 0) return false;
@@ -2426,7 +2426,7 @@ void __fastcall TMainForm::advAcqChange(TObject* Sender)
 
     gps::AcqConfig cfg = configForFile(FFilePath);
     const int n = (int)std::lround(cfg.fs * 1.0e-3);
-    std::vector<signed char> raw;
+    std::vector<std::int8_t> raw;
     if (!advReadIF(raw, n * cfg.numMs + 64) || (int)raw.size() < n * cfg.numMs) {
         FacqLbl->Caption = L"Could not read enough samples from the capture."; return;
     }
@@ -2481,7 +2481,7 @@ void __fastcall TMainForm::advRfClick(TObject* Sender)
     const int K   = 16;                   // segments
     const int hop = L / 2;                // 50% overlap
     const int need = (K - 1) * hop + L;   // samples required
-    std::vector<signed char> raw;
+    std::vector<std::int8_t> raw;
     if (!advReadIF(raw, need + 64) || (int)raw.size() < need) {
         Status(L"Capture too short for a spectrum."); return;
     }
