@@ -14,6 +14,9 @@
 #include <exception>
 #include <map>
 #include <utility>
+#include <thread>
+#include <atomic>
+#include <mutex>
 #include "Acquisition.h"
 #include "Tracking.h"
 #include "NavMessage.h"
@@ -68,9 +71,9 @@ static gps::AcqConfig configForFile(const String& path)
 //
 // The acquisition is CPU-heavy (seconds, longer in a Debug build), so running
 // it on the main thread freezes the window. This worker posts status lines to
-// the memo and the final 32-PRN result set to the chart via Synchronize(),
-// keeping the UI responsive. It frees itself (FreeOnTerminate) and re-enables
-// the button when finished.
+// the memo and fills the bar chart in real time (one PRN at a time) via
+// Synchronize(), keeping the UI responsive. It frees itself (FreeOnTerminate)
+// and re-enables the button when finished.
 //---------------------------------------------------------------------------
 class TAcqThread : public TThread
 {
@@ -92,10 +95,12 @@ private:
     gps::AcqConfig              fCfg;
     String                      fPending;
     std::vector<gps::AcqResult> fAll;
+    gps::AcqResult              fBar;     // PRN result currently being added to the chart
 
     void status(const String& s) { fPending = s; Synchronize(doStatus); }
     void __fastcall doStatus()   { fForm->Status(fPending); }
-    void __fastcall doPublish()  { fForm->ApplyResults(fAll); }
+    void __fastcall doBegin()    { fForm->beginAcquisition(); }
+    void __fastcall doAddBar()   { fForm->addAcqResult(fBar); }
     void __fastcall reenable()
     {
         fForm->btnAcquire->Caption = L"Acquire";
@@ -138,12 +143,17 @@ void __fastcall TAcqThread::Execute()
 
     try
     {
-        // Stream a status line as each satellite is found; the full 32-PRN set
-        // goes to the chart at the end.
+        // Clear the chart, then fill it in real time: acquireAll calls back once
+        // per PRN (1..32, in order), so each bar is added as that PRN is searched
+        // and a status line is streamed for the ones that lock.
+        Synchronize(doBegin);
+
         fAll = gps::acquireAll(sig.data(), sig.size(), fCfg,
             [&](const gps::AcqResult& r)
             {
                 if (Terminated) return;
+                fBar = r;                 // add this PRN's bar (green if found, else grey)
+                Synchronize(doAddBar);
                 if (r.found)
                 {
                     char buf[160];
@@ -157,8 +167,6 @@ void __fastcall TAcqThread::Execute()
         int nfound = 0;
         for (std::size_t i = 0; i < fAll.size(); ++i)
             if (fAll[i].found) ++nfound;
-
-        Synchronize(doPublish);   // fill the chart + cache results (main thread)
 
         char sbuf[80];
         std::snprintf(sbuf, sizeof(sbuf),
@@ -179,6 +187,9 @@ __fastcall TMainForm::TMainForm(TComponent* Owner)
 {
     FHaveResults = false;
     FTrackChartsBuilt = false;
+    FchSky = NULL;
+    FPosCount = 0;
+    for (int i = 0; i <= 32; ++i) FPosRow[i] = 0;
 
     OpenDialog1->Filter =
         L"GPS data (*.bin;*.sim)|*.bin;*.sim|All files (*.*)|*.*";
@@ -199,18 +210,22 @@ void TMainForm::Status(const String& s)
     memoResults->Lines->Add(s);
 }
 //---------------------------------------------------------------------------
-void TMainForm::ApplyResults(const std::vector<gps::AcqResult>& results)
+// Start a fresh sky search: empty the chart and the cached results. Hover stays
+// disabled (FHaveResults = false) until the first bar arrives.
+void TMainForm::beginAcquisition()
 {
     for (int i = 0; i <= 32; ++i) FResults[i] = gps::AcqResult();
-
     Series1->Clear();
-    for (std::size_t i = 0; i < results.size(); ++i)
-    {
-        const gps::AcqResult& r = results[i];
-        if (r.prn >= 1 && r.prn <= 32) FResults[r.prn] = r;
-        TColor c = r.found ? (TColor)clGreen : (TColor)clSilver;
-        Series1->Add(r.peakRatio, IntToStr(r.prn), c);
-    }
+    FHaveResults = false;
+}
+//---------------------------------------------------------------------------
+// Add one PRN's bar as acquisition reaches it (called per PRN, in order 1..32),
+// caching the result so the hover tooltip can show its details immediately.
+void TMainForm::addAcqResult(const gps::AcqResult& r)
+{
+    if (r.prn >= 1 && r.prn <= 32) FResults[r.prn] = r;
+    TColor c = r.found ? (TColor)clGreen : (TColor)clSilver;
+    Series1->Add(r.peakRatio, IntToStr(r.prn), c);
     FHaveResults = true;
 }
 //---------------------------------------------------------------------------
@@ -406,10 +421,21 @@ void TMainForm::buildTrackingCharts()
     FchIQ->View3D = false;
     FchIQ->Legend->Visible = false;
     FchIQ->Title->Text->Text = L"I/Q constellation";
+    FchIQ->BottomAxis->Title->Caption = L"In-phase  I";
+    FchIQ->LeftAxis->Title->Caption   = L"Quadrature  Q";
     FchIQ->Width = pnlTop->ClientHeight;
     FchIQ->Align = alLeft;
     FiqSeries = new TPointSeries(FchIQ);
     FchIQ->AddSeries(FiqSeries);
+
+    // Draggable divider between the constellation and the prompt-I plot.
+    // (Left set before Align so VCL docks it to the RIGHT of FchIQ.)
+    TSplitter* spIQ = new TSplitter(this);
+    spIQ->Parent  = pnlTop;
+    spIQ->Left    = FchIQ->Left + FchIQ->Width;
+    spIQ->Width   = 6;
+    spIQ->Align   = alLeft;
+    spIQ->MinSize = 80;
 
     // Prompt-I over time - the 50 bps nav-bit transitions (wide, fills the row).
     FchPromptI = new TChart(this);
@@ -417,9 +443,20 @@ void TMainForm::buildTrackingCharts()
     FchPromptI->View3D = false;
     FchPromptI->Legend->Visible = false;
     FchPromptI->Title->Text->Text = L"Prompt I (nav bits)";
+    FchPromptI->BottomAxis->Title->Caption = L"epoch (ms)";
+    FchPromptI->LeftAxis->Title->Caption   = L"prompt I correlation";
     FchPromptI->Align = alClient;
     FpromptSeries = new TFastLineSeries(FchPromptI);
     FchPromptI->AddSeries(FpromptSeries);
+
+    // Draggable divider between the top row and the trend plot.
+    // (Top set before Align so VCL docks it BELOW the top row.)
+    TSplitter* spRow = new TSplitter(this);
+    spRow->Parent  = pnl;
+    spRow->Top     = pnlTop->Top + pnlTop->Height;
+    spRow->Height  = 6;
+    spRow->Align   = alTop;
+    spRow->MinSize = 80;
 
     // Bottom row (lower half): Doppler (left axis) + C/N0 (right axis) trends,
     // full width; legend BELOW the plot so it does not cover it.
@@ -429,6 +466,9 @@ void TMainForm::buildTrackingCharts()
     FchTrend->Legend->Visible = true;
     FchTrend->Legend->Alignment = laBottom;
     FchTrend->Title->Text->Text = L"Doppler (Hz) / C/N0 (right)";
+    FchTrend->BottomAxis->Title->Caption = L"epoch (ms)";
+    FchTrend->LeftAxis->Title->Caption   = L"Doppler (Hz)";
+    FchTrend->RightAxis->Title->Caption  = L"C/N0 (dB-Hz)";
     FchTrend->Align = alClient;
     FdopSeries = new TFastLineSeries(FchTrend);
     FchTrend->AddSeries(FdopSeries);
@@ -439,6 +479,130 @@ void TMainForm::buildTrackingCharts()
     Fcn0Series->VertAxis = aRightAxis;
 
     FTrackChartsBuilt = true;
+}
+
+//---------------------------------------------------------------------------
+// One-time: create the sky plot on the Position tab, to the right of the fix-
+// summary memo (the memo is fixed to a left-anchored column to free the space).
+// Built the first time a fix is computed, when the tab sizes are final.
+void TMainForm::buildPositionSky()
+{
+    if (FchSky) return;
+
+    // Container below the button holding the three panes laid out with VCL
+    // alignment, so draggable vertical splitters can sit between them.
+    TPanel* pnlPos = new TPanel(this);
+    pnlPos->Parent = tsPosition;
+    pnlPos->Caption = L"";
+    pnlPos->BevelOuter = bvNone;
+    pnlPos->SetBounds(8, sgSats->Top, tsPosition->ClientWidth - 16,
+                      tsPosition->ClientHeight - sgSats->Top - 8);
+    pnlPos->Anchors = TAnchors() << akLeft << akTop << akRight << akBottom;
+
+    // Satellite table (left). Re-parented into the container and given the
+    // live-update column widths.
+    sgSats->Parent = pnlPos;
+    sgSats->Top = 0; sgSats->Left = 0;
+    sgSats->Align = alLeft;
+    sgSats->DefaultColWidth = 80;
+    sgSats->ColWidths[0] = 40;
+    sgSats->ColWidths[1] = 64;
+    sgSats->ColWidths[2] = 76;
+    sgSats->ColWidths[3] = 60;
+    sgSats->ColWidths[4] = 130;
+
+    // Divider between the table and the summary memo (Left before Align).
+    TSplitter* spP1 = new TSplitter(this);
+    spP1->Parent  = pnlPos;
+    spP1->Left    = sgSats->Width + 1;
+    spP1->Width   = 6;
+    spP1->Align   = alLeft;
+    spP1->MinSize = 120;
+
+    // Fix-summary memo (middle).
+    memoFix->Parent = pnlPos;
+    memoFix->Top    = 0;
+    memoFix->Left   = spP1->Left + spP1->Width + 1;
+    memoFix->Width  = 256;
+    memoFix->Align  = alLeft;
+
+    // Divider between the memo and the sky plot.
+    TSplitter* spP2 = new TSplitter(this);
+    spP2->Parent  = pnlPos;
+    spP2->Left    = memoFix->Left + memoFix->Width + 1;
+    spP2->Width   = 6;
+    spP2->Align   = alLeft;
+    spP2->MinSize = 120;
+
+    // Sky plot (fills the rest on the right; custom-drawn in FchSkyAfterDraw).
+    FchSky = new TChart(this);
+    FchSky->Parent = pnlPos;
+    FchSky->View3D = false;
+    FchSky->Legend->Visible = false;
+    FchSky->Title->Text->Text = L"Sky plot (N up)";
+    FchSky->LeftAxis->Visible   = false;
+    FchSky->BottomAxis->Visible = false;
+    FchSky->RightAxis->Visible  = false;
+    FchSky->TopAxis->Visible    = false;
+    FchSky->OnAfterDraw = FchSkyAfterDraw;
+    FchSky->Align = alClient;
+}
+
+//---------------------------------------------------------------------------
+// Custom-drawn sky plot: polar az/el grid (N up, outer ring = horizon) with one
+// dot + PRN label per satellite that has a look angle from the most recent fix.
+// Always round (sized from the chart rect, not the axes), so no polar package is
+// needed. Draws the empty grid until a fix populates FSkyRows.
+void __fastcall TMainForm::FchSkyAfterDraw(TObject *Sender)
+{
+    TChart* ch = static_cast<TChart*>(Sender);
+    const TRect rc = ch->ChartRect;
+    const int w = rc.Width(), h = rc.Height();
+    if (w < 24 || h < 24) return;
+
+    const int cx = (rc.Left + rc.Right) / 2;
+    const int cy = (rc.Top  + rc.Bottom) / 2;
+    const int R  = (int)(0.46 * (double)std::min(w, h));
+    const double DEG = 3.14159265358979323846 / 180.0;
+
+    // Grid: elevation rings (0 deg horizon, 30, 60) + N-S / E-W cross.
+    ch->Canvas->Brush->Style = bsClear;
+    ch->Canvas->Pen->Style   = psSolid;
+    ch->Canvas->Pen->Width    = 1;
+    ch->Canvas->Pen->Color   = clSilver;
+    for (int el = 0; el <= 60; el += 30) {
+        const int rr = (int)(R * (90 - el) / 90.0);
+        ch->Canvas->Ellipse(cx - rr, cy - rr, cx + rr, cy + rr);
+    }
+    ch->Canvas->MoveTo(cx - R, cy); ch->Canvas->LineTo(cx + R, cy);
+    ch->Canvas->MoveTo(cx, cy - R); ch->Canvas->LineTo(cx, cy + R);
+
+    // Cardinal labels (String args disambiguate TextWidth/TextHeight overloads).
+    const String sN(L"N"), sS(L"S"), sE(L"E"), sW(L"W");
+    const int th = ch->Canvas->TextHeight(sN);
+    ch->Canvas->Font->Color = clGray;
+    ch->Canvas->TextOut(cx - ch->Canvas->TextWidth(sN) / 2, cy - R - th,    sN);
+    ch->Canvas->TextOut(cx - ch->Canvas->TextWidth(sS) / 2, cy + R,         sS);
+    ch->Canvas->TextOut(cx + R + 1,                         cy - th / 2,    sE);
+    ch->Canvas->TextOut(cx - R - 1 - ch->Canvas->TextWidth(sW), cy - th / 2, sW);
+
+    // Satellites (dot + PRN, North up, clockwise azimuth, radius by 90-elevation).
+    for (std::size_t i = 0; i < FSkyRows.size(); ++i) {
+        const GuiSatRow& s = FSkyRows[i];
+        if (!s.elValid) continue;
+        const double rr = R * (90.0 - s.elDeg) / 90.0;
+        const double a  = s.azDeg * DEG;
+        const int x = cx + (int)(rr * std::sin(a));
+        const int y = cy - (int)(rr * std::cos(a));
+        const int d = 7;
+        ch->Canvas->Brush->Style = bsSolid;
+        ch->Canvas->Brush->Color = (TColor)clGreen;
+        ch->Canvas->Pen->Color   = (TColor)clBlack;
+        ch->Canvas->Ellipse(x - d, y - d, x + d, y + d);
+        ch->Canvas->Brush->Style = bsClear;
+        ch->Canvas->Font->Color  = clBlack;
+        ch->Canvas->TextOut(x + d + 1, y - th / 2, IntToStr(s.prn));
+    }
 }
 
 //---------------------------------------------------------------------------
@@ -548,11 +712,19 @@ struct PvtChan {
     std::vector<gps::SubframeRef> subs;
 };
 
-// Worker: for each acquired satellite track ~36 s, decode the ephemeris, then
-// form pseudoranges at the subframe boundary common to the most channels and
-// solve least-squares PVT -> lat/lon/alt. Mirrors PvtConsole.cpp. Runs off the
-// UI thread (heavy: ~1.3 GB buffer, tens of seconds) and posts the fix back via
-// Synchronize.
+// Per-PRN result slot filled by a parallel tracking worker (one slot each, so
+// no locking on the slots themselves).
+struct PerSat {
+    bool    valid = false;   // ephemeris decoded OK
+    PvtChan chan;
+};
+
+// Worker: reads the ~36 s window once into a shared buffer, tracks every
+// acquired satellite IN PARALLEL (one ~1.3 GB read-only buffer shared by a
+// bounded std::thread pool), decodes each ephemeris, then forms pseudoranges at
+// the subframe boundary common to the most channels and solves least-squares
+// PVT -> lat/lon/alt. Mirrors PvtConsole.cpp. Runs off the UI thread and posts
+// progress + the fix back via Synchronize (only this thread touches the GUI).
 class TPvtThread : public TThread
 {
 public:
@@ -577,10 +749,12 @@ private:
     String                      fPending;
     String                      fMsg;
     GuiFix                      fFix;
+    PosSatProgress              fProgRow;
 
     void status(const String& s) { fPending = s; Synchronize(doStatus); }
     void __fastcall doStatus()   { fForm->Status(fPending); }
     void __fastcall doApply()    { fForm->applyFix(fFix); }
+    void __fastcall doAddPosSat(){ fForm->addPosSat(fProgRow); }
     void __fastcall doFail()     { fForm->Status(fMsg); }
     void __fastcall reenable()
     {
@@ -602,42 +776,124 @@ void __fastcall TPvtThread::Execute()
     gps::AcqConfig   rcfg; rcfg.fs = tcfg.fs; rcfg.ifFreq = tcfg.ifFreq;
 
     const int n = (int)std::lround(tcfg.fs * 1.0e-3);
-    const std::size_t need = (std::size_t)(fTrackMs + 2) * n;
-    std::vector<std::int8_t> sig;
-    try { sig.resize(need); }
-    catch (...) { fMsg = L"ERROR: out of memory for the tracking buffer.";
+    const std::size_t need = (std::size_t)(fTrackMs + 2) * n;   // samples one channel needs
+
+    // Every channel tracks the SAME ~36 s window and differs only by its
+    // sub-millisecond code-phase offset, so read the span ONCE into a shared,
+    // read-only buffer (instead of re-reading ~1.3 GB per satellite) and let
+    // each tracker index into it at its own offset.
+    std::size_t maxOff = 0;
+    for (std::size_t k = 0; k < fSats.size(); ++k)
+        if ((std::size_t)fSats[k].codePhaseSamp > maxOff)
+            maxOff = (std::size_t)fSats[k].codePhaseSamp;
+    const std::size_t bufLen = need + maxOff;          // covers [off, off+need) for every PRN
+
+    std::vector<std::int8_t> buf;
+    try { buf.resize(bufLen); }
+    catch (...) { fMsg = L"ERROR: out of memory for the sample buffer.";
                   Synchronize(doFail); Synchronize(reenable); return; }
+    f.seekg(0, std::ios::beg);
+    f.read(reinterpret_cast<char*>(buf.data()), (std::streamsize)bufLen);
+    const std::size_t got = (std::size_t)f.gcount();
 
+    // Track every satellite IN PARALLEL: tracking is pure CPU, independent per
+    // PRN, and all channels share the one read-only buffer. A bounded pool
+    // (<= hardware threads) pulls PRNs off an atomic work index; each result
+    // lands in its own slot (no locking), and completion messages go through a
+    // small queue that ONLY this (VCL) thread drains + posts via Synchronize.
+    const int N = (int)fSats.size();
+    std::vector<PerSat> out((std::size_t)N);
+    std::atomic<int>    nextJob(0);
+    std::atomic<int>    doneCount(0);
+    std::mutex                   msgMu;
+    std::vector<String>          msgQ;
+    std::vector<PosSatProgress>  rowQ;
+    auto pushSat = [&](const String& s, const PosSatProgress& p) {
+        std::lock_guard<std::mutex> g(msgMu);
+        msgQ.push_back(s);
+        rowQ.push_back(p);
+    };
+
+    auto worker = [&]() {
+        for (;;) {
+            if (Terminated) break;
+            const int k = nextJob.fetch_add(1);
+            if (k >= N) break;
+            const gps::AcqResult& a = fSats[(std::size_t)k];
+            PosSatProgress prog; prog.prn = a.prn;
+
+            const std::size_t off = (std::size_t)a.codePhaseSamp;
+            if (off >= got) {
+                prog.state = 0;
+                pushSat(String(L"    PRN ") + IntToStr(a.prn) + L": no data", prog);
+                doneCount.fetch_add(1); continue;
+            }
+            const std::int8_t* sp = buf.data() + off;
+            const std::size_t  sl = got - off;
+
+            const double fd = gps::refineDoppler(sp, sl, a.prn, a.doppler, rcfg);
+            gps::TrackChannel ch(a.prn, fd, tcfg);
+            std::vector<gps::TrackEpoch> ep = ch.run(sp, sl, fTrackMs);
+
+            if (!ep.empty()) {              // mean Doppler over the settled tail
+                std::size_t s0 = ep.size() * 9 / 10; double dsum = 0; int dc = 0;
+                for (std::size_t i = s0; i < ep.size(); ++i) { dsum += ep[i].doppler; ++dc; }
+                prog.doppler = dc ? dsum / dc : 0.0;
+            }
+
+            gps::BitSync bs = gps::findBitSync(ep);
+            prog.cn0 = gps::estimateCN0(ep, bs.valid ? bs.offset : 0);
+            if (!bs.valid) {
+                prog.state = 1;
+                pushSat(String(L"    PRN ") + IntToStr(a.prn) + L": no bit sync", prog);
+                doneCount.fetch_add(1); continue;
+            }
+            std::vector<int> bits = gps::demodulateBits(ep, bs.offset);
+            gps::NavDecode nd = gps::decodeNav(bits, a.prn);
+            prog.state = nd.eph.valid ? 3 : 2;
+            { char b[96]; std::snprintf(b, sizeof(b), "    PRN %d: %d subframes, ephemeris %s",
+                  a.prn, (int)nd.subframes.size(), nd.eph.valid ? "OK" : "incomplete");
+              pushSat(String(b), prog); }
+            if (nd.eph.valid) {
+                PvtChan c;
+                c.prn = a.prn; c.codePhaseSamp = a.codePhaseSamp; c.bitOffset = bs.offset;
+                c.eph = nd.eph; c.ep = std::move(ep); c.subs = nd.subframes;
+                out[(std::size_t)k].chan = std::move(c);
+                out[(std::size_t)k].valid = true;
+            }
+            doneCount.fetch_add(1);
+        }
+    };
+
+    unsigned hw = std::thread::hardware_concurrency();
+    int nWorkers = N;
+    if (hw && nWorkers > (int)hw) nWorkers = (int)hw;
+    { char b[128]; std::snprintf(b, sizeof(b),
+          "  tracking %d satellites in parallel on %d threads (%d ms each)...",
+          N, nWorkers, fTrackMs); status(String(b)); }
+
+    std::vector<std::thread> pool;
+    pool.reserve((std::size_t)nWorkers);
+    for (int i = 0; i < nWorkers; ++i) pool.emplace_back(worker);
+
+    // Drain status lines + per-PRN table rows while the pool runs. ONLY this
+    // (VCL) thread touches the GUI, via Synchronize; the lock is never held
+    // across a Synchronize call.
+    auto drainOnce = [&]() {
+        std::vector<String>         msgs;
+        std::vector<PosSatProgress> rows;
+        { std::lock_guard<std::mutex> g(msgMu); msgs.swap(msgQ); rows.swap(rowQ); }
+        for (std::size_t i = 0; i < msgs.size(); ++i) status(msgs[i]);
+        for (std::size_t i = 0; i < rows.size(); ++i) { fProgRow = rows[i]; Synchronize(doAddPosSat); }
+    };
+    while (doneCount.load() < N && !Terminated) { ::Sleep(150); drainOnce(); }
+    for (std::size_t i = 0; i < pool.size(); ++i) pool[i].join();
+    drainOnce();
+
+    // Assemble surviving channels in acquisition order (deterministic).
     std::vector<PvtChan> chans;
-    for (std::size_t k = 0; k < fSats.size() && !Terminated; ++k) {
-        const gps::AcqResult& a = fSats[k];
-        { char b[96]; std::snprintf(b, sizeof(b),
-              "  PRN %d: tracking %d ms + decoding ephemeris...", a.prn, fTrackMs);
-          status(String(b)); }
-
-        f.clear();
-        f.seekg((std::streamoff)a.codePhaseSamp, std::ios::beg);
-        f.read(reinterpret_cast<char*>(sig.data()), (std::streamsize)need);
-        const std::size_t got = (std::size_t)f.gcount();
-
-        const double fd = gps::refineDoppler(sig.data(), got, a.prn, a.doppler, rcfg);
-        gps::TrackChannel ch(a.prn, fd, tcfg);
-        std::vector<gps::TrackEpoch> ep = ch.run(sig.data(), got, fTrackMs);
-
-        gps::BitSync bs = gps::findBitSync(ep);
-        if (!bs.valid) { status(String(L"    PRN ") + IntToStr(a.prn) + L": no bit sync"); continue; }
-        std::vector<int> bits = gps::demodulateBits(ep, bs.offset);
-        gps::NavDecode nd = gps::decodeNav(bits, a.prn);
-        { char b[96]; std::snprintf(b, sizeof(b), "    PRN %d: %d subframes, ephemeris %s",
-              a.prn, (int)nd.subframes.size(), nd.eph.valid ? "OK" : "incomplete");
-          status(String(b)); }
-        if (!nd.eph.valid) continue;
-
-        PvtChan c;
-        c.prn = a.prn; c.codePhaseSamp = a.codePhaseSamp; c.bitOffset = bs.offset;
-        c.eph = nd.eph; c.ep = std::move(ep); c.subs = nd.subframes;
-        chans.push_back(std::move(c));
-    }
+    for (int k = 0; k < N; ++k)
+        if (out[(std::size_t)k].valid) chans.push_back(std::move(out[(std::size_t)k].chan));
 
     if (chans.size() < 4) {
         fMsg = L"Position: fewer than 4 satellites yielded a full ephemeris (need >= 4).";
@@ -706,6 +962,28 @@ void __fastcall TPvtThread::Execute()
     fFix.residRms   = sol.residRms;
     fFix.radiusKm   = std::sqrt(sol.x*sol.x + sol.y*sol.y + sol.z*sol.z) / 1e3;
 
+    // Look angles for the sky plot: rotate each SV's ECEF offset into the
+    // receiver's local East/North/Up, then to azimuth (from N, CW) / elevation.
+    {
+        const double DEG  = 3.14159265358979323846 / 180.0;
+        const double latR = sol.lat * DEG, lonR = sol.lon * DEG;
+        const double sLat = std::sin(latR), cLat = std::cos(latR);
+        const double sLon = std::sin(lonR), cLon = std::cos(lonR);
+        for (std::size_t i = 0; i < fFix.rows.size() && i < sats.size(); ++i) {
+            const double dx = sats[i].x - sol.x;
+            const double dy = sats[i].y - sol.y;
+            const double dz = sats[i].z - sol.z;
+            const double e  = -sLon * dx + cLon * dy;
+            const double nN = -sLat * cLon * dx - sLat * sLon * dy + cLat * dz;
+            const double u  =  cLat * cLon * dx + cLat * sLon * dy + sLat * dz;
+            double az = std::atan2(e, nN) / DEG; if (az < 0.0) az += 360.0;
+            const double el = std::atan2(u, std::sqrt(e * e + nN * nN)) / DEG;
+            fFix.rows[i].azDeg   = az;
+            fFix.rows[i].elDeg   = el;
+            fFix.rows[i].elValid = (el >= 0.0);
+        }
+    }
+
     Synchronize(doApply);
     status(L"Position fix complete.");
     Synchronize(reenable);
@@ -714,22 +992,20 @@ void __fastcall TPvtThread::Execute()
 //---------------------------------------------------------------------------
 void TMainForm::applyFix(const GuiFix& fix)
 {
-    // Satellite table (PRN, pseudorange, SV ECEF position).
-    sgSats->RowCount = (int)fix.rows.size() + 1;
-    sgSats->Cells[0][0] = L"PRN";
-    sgSats->Cells[1][0] = L"Pseudorange km";
-    sgSats->Cells[2][0] = L"SV X (km)";
-    sgSats->Cells[3][0] = L"SV Y (km)";
-    sgSats->Cells[4][0] = L"SV Z (km)";
+    // The PRN / C/N0 / Doppler / Eph rows were filled live during the run; now
+    // fill the pseudorange column for the satellites that made it into the fix.
+    char pb[40];
     for (std::size_t i = 0; i < fix.rows.size(); ++i) {
         const GuiSatRow& r = fix.rows[i];
-        const int row = (int)i + 1;
-        char b[40];
-        sgSats->Cells[0][row] = IntToStr(r.prn);
-        std::snprintf(b, sizeof(b), "%.3f", r.prKm); sgSats->Cells[1][row] = String(b);
-        std::snprintf(b, sizeof(b), "%.0f", r.x);    sgSats->Cells[2][row] = String(b);
-        std::snprintf(b, sizeof(b), "%.0f", r.y);    sgSats->Cells[3][row] = String(b);
-        std::snprintf(b, sizeof(b), "%.0f", r.z);    sgSats->Cells[4][row] = String(b);
+        int row = (r.prn >= 1 && r.prn <= 32) ? FPosRow[r.prn] : 0;
+        if (row == 0) {                       // safety: not seen live -> append
+            row = ++FPosCount;
+            if (sgSats->RowCount < row + 1) sgSats->RowCount = row + 1;
+            FPosRow[r.prn] = row;
+            sgSats->Cells[0][row] = IntToStr(r.prn);
+        }
+        std::snprintf(pb, sizeof(pb), "%.3f", r.prKm);
+        sgSats->Cells[4][row] = String(pb);
     }
 
     const bool sane = (fix.radiusKm > 6300.0 && fix.radiusKm < 6420.0)
@@ -767,6 +1043,39 @@ void TMainForm::applyFix(const GuiFix& fix)
         "Position fix: Lat %.6f, Lon %.6f, Alt %.1f m  (%d sats, GDOP %.2f, RMS %.1f m)",
         fix.lat, fix.lon, fix.alt, fix.nSats, fix.gdop, fix.residRms);
     Status(String(sb));
+
+    // Refresh the sky plot with the satellites' look angles.
+    FSkyRows = fix.rows;
+    if (FchSky) FchSky->Repaint();
+}
+
+//---------------------------------------------------------------------------
+// Add or refresh one PRN's row in the Position table as a parallel worker
+// finishes it (PRN / C/N0 / Doppler / Eph). The pseudorange column is filled in
+// later by applyFix once the fix is solved.
+void TMainForm::addPosSat(const PosSatProgress& p)
+{
+    if (p.prn < 1 || p.prn > 32) return;
+
+    int row = FPosRow[p.prn];
+    if (row == 0) {
+        row = ++FPosCount;                          // data rows are 1..FPosCount
+        if (sgSats->RowCount < row + 1) sgSats->RowCount = row + 1;
+        FPosRow[p.prn] = row;
+    }
+
+    char b[32];
+    sgSats->Cells[0][row] = IntToStr(p.prn);
+    if (p.state >= 1) {
+        std::snprintf(b, sizeof(b), "%.1f",  p.cn0);     sgSats->Cells[1][row] = String(b);
+        std::snprintf(b, sizeof(b), "%+.0f", p.doppler); sgSats->Cells[2][row] = String(b);
+    } else {
+        sgSats->Cells[1][row] = L"--";
+        sgSats->Cells[2][row] = L"--";
+    }
+    sgSats->Cells[3][row] = (p.state == 3) ? L"OK"
+                          : (p.state == 2) ? L"partial"
+                          : (p.state == 1) ? L"no sync" : L"no data";
 }
 
 //---------------------------------------------------------------------------
@@ -780,16 +1089,22 @@ void __fastcall TMainForm::btnFixClick(TObject *Sender)
         if (FResults[prn].found) found.push_back(FResults[prn]);
     if (found.size() < 4) { Status(L"Need >= 4 acquired satellites for a position fix."); return; }
 
-    // Reset the satellite table header.
+    buildPositionSky();                 // create the Position layout + sky plot (once)
+
+    // Reset the satellite table for live, per-PRN updates during the parallel run.
+    for (int i = 0; i <= 32; ++i) FPosRow[i] = 0;
+    FPosCount = 0;
     sgSats->RowCount = 2;
     for (int r = 1; r < sgSats->RowCount; ++r)
         for (int c = 0; c < sgSats->ColCount; ++c) sgSats->Cells[c][r] = L"";
     sgSats->Cells[0][0] = L"PRN";
-    sgSats->Cells[1][0] = L"Pseudorange km";
-    sgSats->Cells[2][0] = L"SV X (km)";
-    sgSats->Cells[3][0] = L"SV Y (km)";
-    sgSats->Cells[4][0] = L"SV Z (km)";
+    sgSats->Cells[1][0] = L"C/N0";
+    sgSats->Cells[2][0] = L"Doppler";
+    sgSats->Cells[3][0] = L"Eph";
+    sgSats->Cells[4][0] = L"Pseudorange km";
     memoFix->Clear();
+    FSkyRows.clear();                   // drop the previous fix's sky dots
+    if (FchSky) FchSky->Repaint();
 
     btnFix->Enabled = false;
     btnFix->Caption = L"Computing...";

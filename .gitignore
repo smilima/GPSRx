@@ -41,6 +41,9 @@ __recovery/
 *.il?
 *.#*
 
+# ---- Build / scratch logs ----
+*.log
+
 # ---- Large GPS IF sample captures (gigabytes; not distributed via GitHub) ----
 *.bin
 *.sim

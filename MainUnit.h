@@ -35,6 +35,8 @@ struct GuiSatRow {
 	double prKm = 0;            // pseudorange (km)
 	double x = 0, y = 0, z = 0; // SV ECEF position (km)
 	double svClkUs = 0;         // SV clock correction (us)
+	double azDeg = 0, elDeg = 0;// look angle from the receiver (deg), for the sky plot
+	bool   elValid = false;     // above the horizon -> plotted
 };
 // The least-squares position fix, carried from the worker to the UI.
 struct GuiFix {
@@ -49,6 +51,15 @@ struct GuiFix {
 	double residRms = 0;             // post-fit residual RMS (m)
 	double radiusKm = 0;             // ECEF radius (km)
 	std::vector<GuiSatRow> rows;
+};
+//---------------------------------------------------------------------------
+// Per-PRN progress pushed from a parallel PVT worker as each satellite finishes
+// (so the Position table can fill in live, before the fix is solved).
+struct PosSatProgress {
+	int    prn = 0;
+	double cn0 = 0;       // dB-Hz
+	double doppler = 0;   // Hz
+	int    state = 0;     // 0 no-data, 1 no-sync, 2 eph-incomplete, 3 eph-OK
 };
 //---------------------------------------------------------------------------
 class TMainForm : public TForm
@@ -97,19 +108,27 @@ private:	// User declarations
 	TChart          *FchIQ;          // I/Q constellation
 	TChart          *FchPromptI;     // prompt-I (nav bits) over time
 	TChart          *FchTrend;       // Doppler + C/N0 trends
+	TChart          *FchSky;         // sky plot (az/el), custom-drawn in FchSkyAfterDraw
 	TPointSeries    *FiqSeries;
 	TFastLineSeries *FpromptSeries;
 	TFastLineSeries *FdopSeries;
 	TFastLineSeries *Fcn0Series;
+	std::vector<GuiSatRow> FSkyRows; // satellites + look angles from the latest fix
+	int              FPosRow[33];    // Position-table row for each PRN (0 = not shown yet)
+	int              FPosCount;      // data rows currently in the Position table
 	void buildTrackingCharts();
+	void buildPositionSky();         // create the Position-tab layout + sky plot (once)
 	void plotChannel(int idx);
+	void __fastcall FchSkyAfterDraw(TObject *Sender);
 public:		// User declarations
 	__fastcall TMainForm(TComponent* Owner);
 	// Called from worker threads via Synchronize (main thread):
 	void Status(const String& s);                                   // append one status line to the memo
-	void ApplyResults(const std::vector<gps::AcqResult>& results);  // fill the bar chart + cache results
+	void beginAcquisition();                                        // clear the chart for a new sky search
+	void addAcqResult(const gps::AcqResult& r);                     // add one PRN's bar as it is acquired (real time)
 	void addTrackedChannel(const GuiTrackedChannel& gc);            // add a tracked sat row + plot if first
 	void applyFix(const GuiFix& fix);                               // fill the sat table + fix summary
+	void addPosSat(const PosSatProgress& p);                        // add/update one PRN row live during the fix
 };
 //---------------------------------------------------------------------------
 extern PACKAGE TMainForm *MainForm;
