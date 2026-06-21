@@ -120,6 +120,16 @@ private:	// User declarations
 	void buildPositionSky();         // create the Position-tab layout + sky plot (once)
 	void plotChannel(int idx);
 	void __fastcall FchSkyAfterDraw(TObject *Sender);
+
+	// --- DAC streaming + settings ---
+	double           FDacSampleRate; // Hz  (DAC / stream sample rate -> fs)
+	double           FIfHz;          // Hz  (intermediate frequency -> ifFreq)
+	TButton*         FbtnStream;     // runtime "Stream from DAC" button on Panel1
+	TThread*         FStream;        // running continuous-receiver worker (NULL when idle)
+	void loadSettings();
+	void saveSettings();
+	void __fastcall settingsClick(TObject* Sender);
+	void __fastcall btnStreamClick(TObject* Sender);
 public:		// User declarations
 	__fastcall TMainForm(TComponent* Owner);
 	// Called from worker threads via Synchronize (main thread):
@@ -129,6 +139,10 @@ public:		// User declarations
 	void addTrackedChannel(const GuiTrackedChannel& gc);            // add a tracked sat row + plot if first
 	void applyFix(const GuiFix& fix);                               // fill the sat table + fix summary
 	void addPosSat(const PosSatProgress& p);                        // add/update one PRN row live during the fix
+	void resetPositionTable();                                      // clear + relabel the Position table
+	void streamStopped();                                           // re-enable the UI when streaming ends
+	void showAcqResults(const std::vector<gps::AcqResult>& results);// fill the acq bar chart from a result set
+	void resetTracking();                                           // clear the Tracking grid + cached channels
 };
 //---------------------------------------------------------------------------
 extern PACKAGE TMainForm *MainForm;

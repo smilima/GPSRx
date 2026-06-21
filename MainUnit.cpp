@@ -17,6 +17,8 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <memory>
+#include <System.IniFiles.hpp>
 #include "Acquisition.h"
 #include "Tracking.h"
 #include "NavMessage.h"
@@ -202,11 +204,95 @@ __fastcall TMainForm::TMainForm(TComponent* Owner)
     Chart1->Hint = L"Hover a bar for PRN details";   // arm the hint so dynamic text can show
     Application->HintHidePause = 30000;              // keep the PRN tooltip up ~30 s (default 2.5 s)
 
+    // --- DAC streaming + settings ---
+    FStream = NULL;
+    loadSettings();                                  // fills FDacSampleRate / FIfHz from GPSRx.ini
+
+    // View -> Settings menu (built at runtime, so no .dfm edit is needed).
+    TMenuItem* miView = new TMenuItem(MainMenu1);
+    miView->Caption = L"View";
+    MainMenu1->Items->Add(miView);
+    TMenuItem* miSettings = new TMenuItem(miView);
+    miSettings->Caption = L"Settings...";
+    miSettings->OnClick = settingsClick;
+    miView->Add(miSettings);
+
+    // "Stream from DAC" button on the top panel, to the right of the file edit.
+    FbtnStream = new TButton(this);
+    FbtnStream->Parent  = Panel1;
+    FbtnStream->Caption = L"Stream from DAC";
+    FbtnStream->SetBounds(editFile->Left + editFile->Width + 12, editFile->Top - 2, 130, 27);
+    FbtnStream->OnClick = btnStreamClick;
+
     Status(L"Ready. Open a .bin or .sim capture from File > Open, then click Acquire.");
+}
+//---------------------------------------------------------------------------
+// Settings persistence (GPSRx.ini next to the executable). The DAC sample rate
+// maps to the receiver sample rate fs; the IF maps to ifFreq. Defaults match the
+// bundled capture so the simulated stream decodes out of the box.
+void TMainForm::loadSettings()
+{
+    const String ini = ChangeFileExt(Application->ExeName, L".ini");
+    std::unique_ptr<TIniFile> f(new TIniFile(ini));
+    FDacSampleRate = f->ReadFloat(L"Stream", L"DacSampleRateHz", 38192000.0);
+    FIfHz          = f->ReadFloat(L"Stream", L"IfHz",             9550000.0);
+}
+//---------------------------------------------------------------------------
+void TMainForm::saveSettings()
+{
+    const String ini = ChangeFileExt(Application->ExeName, L".ini");
+    std::unique_ptr<TIniFile> f(new TIniFile(ini));
+    f->WriteFloat(L"Stream", L"DacSampleRateHz", FDacSampleRate);
+    f->WriteFloat(L"Stream", L"IfHz",            FIfHz);
+    f->UpdateFile();
+}
+//---------------------------------------------------------------------------
+// View -> Settings: a small modal dialog (built in code) for the two rates.
+void __fastcall TMainForm::settingsClick(TObject* Sender)
+{
+    std::unique_ptr<TForm> dlg(new TForm((TComponent*)NULL));
+    dlg->Caption      = L"Settings";
+    dlg->BorderStyle  = bsDialog;
+    dlg->Position     = poMainFormCenter;
+    dlg->ClientWidth  = 340;
+    dlg->ClientHeight = 150;
+
+    TLabel* l1 = new TLabel(dlg.get());
+    l1->Parent = dlg.get(); l1->SetBounds(16, 20, 170, 20); l1->Caption = L"DAC sample rate (Hz)";
+    TEdit* e1 = new TEdit(dlg.get());
+    e1->Parent = dlg.get(); e1->SetBounds(190, 16, 134, 24); e1->Text = FloatToStr(FDacSampleRate);
+
+    TLabel* l2 = new TLabel(dlg.get());
+    l2->Parent = dlg.get(); l2->SetBounds(16, 58, 170, 20); l2->Caption = L"IF (Hz)";
+    TEdit* e2 = new TEdit(dlg.get());
+    e2->Parent = dlg.get(); e2->SetBounds(190, 54, 134, 24); e2->Text = FloatToStr(FIfHz);
+
+    TButton* ok = new TButton(dlg.get());
+    ok->Parent = dlg.get(); ok->Caption = L"OK"; ok->Default = true;
+    ok->ModalResult = mrOk; ok->SetBounds(150, 106, 80, 28);
+    TButton* cancel = new TButton(dlg.get());
+    cancel->Parent = dlg.get(); cancel->Caption = L"Cancel"; cancel->Cancel = true;
+    cancel->ModalResult = mrCancel; cancel->SetBounds(240, 106, 80, 28);
+
+    dlg->ActiveControl = e1;
+    if (dlg->ShowModal() == mrOk) {
+        double dr = FDacSampleRate, iff = FIfHz;
+        try { dr  = StrToFloat(e1->Text); } catch (...) {}
+        try { iff = StrToFloat(e2->Text); } catch (...) {}
+        if (dr  > 0) FDacSampleRate = dr;
+        if (iff > 0) FIfHz          = iff;
+        saveSettings();
+        char b[120];
+        std::snprintf(b, sizeof(b), "Settings saved: DAC %.3f MHz, IF %.3f MHz.",
+                      FDacSampleRate / 1e6, FIfHz / 1e6);
+        Status(String(b));
+    }
 }
 //---------------------------------------------------------------------------
 void TMainForm::Status(const String& s)
 {
+    // Cap the log so continuous streaming cannot grow the memo unbounded.
+    if (memoResults->Lines->Count > 2000) memoResults->Lines->Delete(0);
     memoResults->Lines->Add(s);
 }
 //---------------------------------------------------------------------------
@@ -227,6 +313,13 @@ void TMainForm::addAcqResult(const gps::AcqResult& r)
     TColor c = r.found ? (TColor)clGreen : (TColor)clSilver;
     Series1->Add(r.peakRatio, IntToStr(r.prn), c);
     FHaveResults = true;
+}
+//---------------------------------------------------------------------------
+// Fill the acquisition bar chart from a complete result set (used while streaming).
+void TMainForm::showAcqResults(const std::vector<gps::AcqResult>& results)
+{
+    beginAcquisition();
+    for (std::size_t i = 0; i < results.size(); ++i) addAcqResult(results[i]);
 }
 //---------------------------------------------------------------------------
 void __fastcall TMainForm::Chart1MouseMove(TObject *Sender, TShiftState Shift,
@@ -658,6 +751,21 @@ void TMainForm::addTrackedChannel(const GuiTrackedChannel& gc)
 }
 
 //---------------------------------------------------------------------------
+// Clear the Tracking grid + cached channels (shared by Track Acquired + streaming).
+void TMainForm::resetTracking()
+{
+    buildTrackingCharts();
+    FTracked.clear();
+    sgChannels->RowCount = 2;
+    for (int r = 1; r < sgChannels->RowCount; ++r)
+        for (int c = 0; c < sgChannels->ColCount; ++c) sgChannels->Cells[c][r] = L"";
+    sgChannels->Cells[0][0] = L"PRN";
+    sgChannels->Cells[1][0] = L"Doppler";
+    sgChannels->Cells[2][0] = L"C/N0";
+    sgChannels->Cells[3][0] = L"Status";
+}
+
+//---------------------------------------------------------------------------
 void __fastcall TMainForm::btnTrackClick(TObject *Sender)
 {
     if (!FHaveResults) { Status(L"Acquire satellites first (Acquisition tab)."); return; }
@@ -668,15 +776,7 @@ void __fastcall TMainForm::btnTrackClick(TObject *Sender)
         if (FResults[prn].found) found.push_back(FResults[prn]);
     if (found.empty()) { Status(L"No acquired satellites to track."); return; }
 
-    buildTrackingCharts();
-    FTracked.clear();
-    sgChannels->RowCount = 2;
-    for (int r = 1; r < sgChannels->RowCount; ++r)
-        for (int c = 0; c < sgChannels->ColCount; ++c) sgChannels->Cells[c][r] = L"";
-    sgChannels->Cells[0][0] = L"PRN";
-    sgChannels->Cells[1][0] = L"Doppler";
-    sgChannels->Cells[2][0] = L"C/N0";
-    sgChannels->Cells[3][0] = L"Status";
+    resetTracking();
 
     btnTrack->Enabled = false;
     btnTrack->Caption = L"Tracking...";
@@ -718,6 +818,92 @@ struct PerSat {
     bool    valid = false;   // ephemeris decoded OK
     PvtChan chan;
 };
+
+// Form pseudoranges at the subframe boundary common to the most channels and
+// solve least-squares PVT -> lat/lon/alt + per-satellite rows (incl. az/el for
+// the sky plot). GUI-free and deterministic; shared by the single-fix worker
+// (TPvtThread) and the continuous streaming worker (TStreamThread). Returns a
+// GuiFix with ok=false if fewer than 4 channels align to a common subframe.
+static GuiFix solveFixFromChannels(const std::vector<PvtChan>& chans, double fs)
+{
+    GuiFix fix;
+    const double C = 299792458.0;
+
+    std::map<int, std::vector<std::pair<int,int> > > byTow;   // tow -> [(chIdx, bitIndex)]
+    for (int ci = 0; ci < (int)chans.size(); ++ci)
+        for (std::size_t j = 0; j < chans[ci].subs.size(); ++j)
+            byTow[chans[ci].subs[j].towCount].push_back(
+                std::make_pair(ci, chans[ci].subs[j].bitIndex));
+
+    int bestTow = -1; std::size_t bestCnt = 0;
+    for (std::map<int, std::vector<std::pair<int,int> > >::iterator it = byTow.begin();
+         it != byTow.end(); ++it)
+        if (it->second.size() > bestCnt) { bestCnt = it->second.size(); bestTow = it->first; }
+    if (bestTow < 0) return fix;                                // no parity-passing subframe
+
+    const double samplesPerCode = std::round(fs / 1000.0);
+    const double START_OFFSET   = 68.802;                      // ms, nominal travel time
+    std::vector<double>        ttms;
+    std::vector<gps::SatState> sats;
+    std::vector<int>           usedPrn;
+    const double transmitTime = bestTow * 6.0 - 6.0;           // subframe leading-edge GPS time
+
+    const std::vector<std::pair<int,int> >& list = byTow[bestTow];
+    for (std::size_t q = 0; q < list.size(); ++q) {
+        const int ci = list[q].first, bi = list[q].second;
+        const std::size_t ms = (std::size_t)(chans[ci].bitOffset + bi * 20);
+        if (ms >= chans[ci].ep.size()) continue;
+        const long long absSample =
+            chans[ci].codePhaseSamp + (long long)chans[ci].ep[ms].sampleIndex;
+        ttms.push_back((double)absSample / samplesPerCode);
+        sats.push_back(gps::satPosition(chans[ci].eph, transmitTime));
+        usedPrn.push_back(chans[ci].prn);
+    }
+    if (ttms.size() < 4) return fix;                           // ok stays false
+
+    const double mn = std::floor(*std::min_element(ttms.begin(), ttms.end()));
+    std::vector<double> pr(ttms.size());
+    fix.bestTow = bestTow;
+    for (std::size_t i = 0; i < ttms.size(); ++i) {
+        ttms[i] = ttms[i] - mn + START_OFFSET;                 // ms
+        pr[i]   = ttms[i] * (C / 1000.0);                      // meters
+        GuiSatRow row;
+        row.prn  = usedPrn[i];
+        row.prKm = pr[i] / 1000.0;
+        row.x = sats[i].x / 1e3; row.y = sats[i].y / 1e3; row.z = sats[i].z / 1e3;
+        row.svClkUs = sats[i].clockBias * 1e6;
+        fix.rows.push_back(row);
+    }
+
+    gps::PvtSolution sol = gps::solvePvt(pr, sats);
+    fix.ok         = sol.ok;
+    fix.nSats      = (int)pr.size();
+    fix.x = sol.x; fix.y = sol.y; fix.z = sol.z;
+    fix.lat = sol.lat; fix.lon = sol.lon; fix.alt = sol.alt;
+    fix.clockBiasM = sol.clockBias;
+    fix.gdop       = sol.gdop;
+    fix.iterations = sol.iterations;
+    fix.residRms   = sol.residRms;
+    fix.radiusKm   = std::sqrt(sol.x*sol.x + sol.y*sol.y + sol.z*sol.z) / 1e3;
+
+    // Look angles for the sky plot: ECEF offset -> local East/North/Up -> az/el.
+    const double DEG  = 3.14159265358979323846 / 180.0;
+    const double latR = sol.lat * DEG, lonR = sol.lon * DEG;
+    const double sLat = std::sin(latR), cLat = std::cos(latR);
+    const double sLon = std::sin(lonR), cLon = std::cos(lonR);
+    for (std::size_t i = 0; i < fix.rows.size() && i < sats.size(); ++i) {
+        const double dx = sats[i].x - sol.x, dy = sats[i].y - sol.y, dz = sats[i].z - sol.z;
+        const double e  = -sLon * dx + cLon * dy;
+        const double nN = -sLat * cLon * dx - sLat * sLon * dy + cLat * dz;
+        const double u  =  cLat * cLon * dx + cLat * sLon * dy + sLat * dz;
+        double az = std::atan2(e, nN) / DEG; if (az < 0.0) az += 360.0;
+        const double el = std::atan2(u, std::sqrt(e * e + nN * nN)) / DEG;
+        fix.rows[i].azDeg   = az;
+        fix.rows[i].elDeg   = el;
+        fix.rows[i].elValid = (el >= 0.0);
+    }
+    return fix;
+}
 
 // Worker: reads the ~36 s window once into a shared buffer, tracks every
 // acquired satellite IN PARALLEL (one ~1.3 GB read-only buffer shared by a
@@ -765,8 +951,6 @@ private:
 
 void __fastcall TPvtThread::Execute()
 {
-    const double C = 299792458.0;
-
     std::ifstream f(AnsiString(fFile).c_str(), std::ios::binary);
     if (!f) { fMsg = L"ERROR: cannot open file for the position fix.";
               Synchronize(doFail); Synchronize(reenable); return; }
@@ -900,88 +1084,10 @@ void __fastcall TPvtThread::Execute()
         Synchronize(doFail); Synchronize(reenable); return;
     }
 
-    // Subframe boundary (TOW count) common to the most channels.
-    std::map<int, std::vector<std::pair<int,int> > > byTow;   // tow -> [(chIdx, bitIndex)]
-    for (int ci = 0; ci < (int)chans.size(); ++ci)
-        for (std::size_t j = 0; j < chans[ci].subs.size(); ++j)
-            byTow[chans[ci].subs[j].towCount].push_back(
-                std::make_pair(ci, chans[ci].subs[j].bitIndex));
-
-    int bestTow = -1; std::size_t bestCnt = 0;
-    for (std::map<int, std::vector<std::pair<int,int> > >::iterator it = byTow.begin();
-         it != byTow.end(); ++it)
-        if (it->second.size() > bestCnt) { bestCnt = it->second.size(); bestTow = it->first; }
-
-    // Form pseudoranges at that common instant (SoftGNSS convention).
-    const double samplesPerCode = std::round(tcfg.fs / 1000.0);
-    const double START_OFFSET   = 68.802;                      // ms, nominal travel time
-    std::vector<double>        ttms;
-    std::vector<gps::SatState> sats;
-    std::vector<int>           usedPrn;
-    const double transmitTime = bestTow * 6.0 - 6.0;           // subframe leading-edge GPS time
-
-    const std::vector<std::pair<int,int> >& list = byTow[bestTow];
-    for (std::size_t q = 0; q < list.size(); ++q) {
-        const int ci = list[q].first, bi = list[q].second;
-        const std::size_t ms = (std::size_t)(chans[ci].bitOffset + bi * 20);
-        if (ms >= chans[ci].ep.size()) continue;
-        const long long absSample =
-            chans[ci].codePhaseSamp + (long long)chans[ci].ep[ms].sampleIndex;
-        ttms.push_back((double)absSample / samplesPerCode);
-        sats.push_back(gps::satPosition(chans[ci].eph, transmitTime));
-        usedPrn.push_back(chans[ci].prn);
-    }
-    if (ttms.size() < 4) {
-        fMsg = L"Position: fewer than 4 channels aligned to a common subframe.";
+    fFix = solveFixFromChannels(chans, tcfg.fs);
+    if (!fFix.ok) {
+        fMsg = L"Position: could not align >= 4 channels to a common subframe.";
         Synchronize(doFail); Synchronize(reenable); return;
-    }
-
-    const double mn = std::floor(*std::min_element(ttms.begin(), ttms.end()));
-    std::vector<double> pr(ttms.size());
-    fFix = GuiFix();
-    fFix.bestTow = bestTow;
-    for (std::size_t i = 0; i < ttms.size(); ++i) {
-        ttms[i] = ttms[i] - mn + START_OFFSET;                 // ms
-        pr[i]   = ttms[i] * (C / 1000.0);                      // meters
-        GuiSatRow row;
-        row.prn  = usedPrn[i];
-        row.prKm = pr[i] / 1000.0;
-        row.x = sats[i].x / 1e3; row.y = sats[i].y / 1e3; row.z = sats[i].z / 1e3;
-        row.svClkUs = sats[i].clockBias * 1e6;
-        fFix.rows.push_back(row);
-    }
-
-    gps::PvtSolution sol = gps::solvePvt(pr, sats);
-    fFix.ok         = sol.ok;
-    fFix.nSats      = (int)pr.size();
-    fFix.x = sol.x; fFix.y = sol.y; fFix.z = sol.z;
-    fFix.lat = sol.lat; fFix.lon = sol.lon; fFix.alt = sol.alt;
-    fFix.clockBiasM = sol.clockBias;
-    fFix.gdop       = sol.gdop;
-    fFix.iterations = sol.iterations;
-    fFix.residRms   = sol.residRms;
-    fFix.radiusKm   = std::sqrt(sol.x*sol.x + sol.y*sol.y + sol.z*sol.z) / 1e3;
-
-    // Look angles for the sky plot: rotate each SV's ECEF offset into the
-    // receiver's local East/North/Up, then to azimuth (from N, CW) / elevation.
-    {
-        const double DEG  = 3.14159265358979323846 / 180.0;
-        const double latR = sol.lat * DEG, lonR = sol.lon * DEG;
-        const double sLat = std::sin(latR), cLat = std::cos(latR);
-        const double sLon = std::sin(lonR), cLon = std::cos(lonR);
-        for (std::size_t i = 0; i < fFix.rows.size() && i < sats.size(); ++i) {
-            const double dx = sats[i].x - sol.x;
-            const double dy = sats[i].y - sol.y;
-            const double dz = sats[i].z - sol.z;
-            const double e  = -sLon * dx + cLon * dy;
-            const double nN = -sLat * cLon * dx - sLat * sLon * dy + cLat * dz;
-            const double u  =  cLat * cLon * dx + cLat * sLon * dy + sLat * dz;
-            double az = std::atan2(e, nN) / DEG; if (az < 0.0) az += 360.0;
-            const double el = std::atan2(u, std::sqrt(e * e + nN * nN)) / DEG;
-            fFix.rows[i].azDeg   = az;
-            fFix.rows[i].elDeg   = el;
-            fFix.rows[i].elValid = (el >= 0.0);
-        }
     }
 
     Synchronize(doApply);
@@ -1079,6 +1185,22 @@ void TMainForm::addPosSat(const PosSatProgress& p)
 }
 
 //---------------------------------------------------------------------------
+// Clear + relabel the Position table (shared by Compute Fix and streaming).
+void TMainForm::resetPositionTable()
+{
+    for (int i = 0; i <= 32; ++i) FPosRow[i] = 0;
+    FPosCount = 0;
+    sgSats->RowCount = 2;
+    for (int r = 1; r < sgSats->RowCount; ++r)
+        for (int c = 0; c < sgSats->ColCount; ++c) sgSats->Cells[c][r] = L"";
+    sgSats->Cells[0][0] = L"PRN";
+    sgSats->Cells[1][0] = L"C/N0";
+    sgSats->Cells[2][0] = L"Doppler";
+    sgSats->Cells[3][0] = L"Eph";
+    sgSats->Cells[4][0] = L"Pseudorange km";
+}
+
+//---------------------------------------------------------------------------
 void __fastcall TMainForm::btnFixClick(TObject *Sender)
 {
     if (!FHaveResults)        { Status(L"Acquire satellites first (Acquisition tab)."); return; }
@@ -1091,17 +1213,7 @@ void __fastcall TMainForm::btnFixClick(TObject *Sender)
 
     buildPositionSky();                 // create the Position layout + sky plot (once)
 
-    // Reset the satellite table for live, per-PRN updates during the parallel run.
-    for (int i = 0; i <= 32; ++i) FPosRow[i] = 0;
-    FPosCount = 0;
-    sgSats->RowCount = 2;
-    for (int r = 1; r < sgSats->RowCount; ++r)
-        for (int c = 0; c < sgSats->ColCount; ++c) sgSats->Cells[c][r] = L"";
-    sgSats->Cells[0][0] = L"PRN";
-    sgSats->Cells[1][0] = L"C/N0";
-    sgSats->Cells[2][0] = L"Doppler";
-    sgSats->Cells[3][0] = L"Eph";
-    sgSats->Cells[4][0] = L"Pseudorange km";
+    resetPositionTable();
     memoFix->Clear();
     FSkyRows.clear();                   // drop the previous fix's sky dots
     if (FchSky) FchSky->Repaint();
@@ -1119,5 +1231,282 @@ void __fastcall TMainForm::btnFixClick(TObject *Sender)
 
     TPvtThread* w = new TPvtThread(this, FFilePath, found, cfg, 36000);
     w->Start();
+}
+
+//---------------------------------------------------------------------------
+// Streaming "DAC" receiver
+//---------------------------------------------------------------------------
+// TStreamThread - a continuous receiver. It stands in for a live DAC IQ stream
+// by looping over the loaded capture: each pass acquires at the current read
+// offset, tracks every visible satellite in parallel, decodes, solves PVT, and
+// updates the Position tab live; then it advances the offset (wrapping at EOF)
+// and repeats until stopped. Re-acquiring each pass lets the satellite set
+// follow what is "in view". The file read is the only DAC-specific seam: swap it
+// for a real device buffer and the rest is unchanged.
+//---------------------------------------------------------------------------
+class TStreamThread : public TThread
+{
+public:
+    __fastcall TStreamThread(TMainForm* AForm, const String& AFile,
+                             const gps::AcqConfig& ACfg, int ATrackMs)
+        : TThread(true), fForm(AForm), fFile(AFile), fCfg(ACfg),
+          fTrackMs(ATrackMs), fStop(false), fIter(0)
+    {
+        FreeOnTerminate = true;
+    }
+    void requestStop() { fStop = true; }
+
+protected:
+    void __fastcall Execute();
+
+private:
+    TMainForm*        fForm;
+    String            fFile;
+    gps::AcqConfig    fCfg;
+    int               fTrackMs;
+    std::atomic<bool> fStop;
+    int               fIter;
+    String            fPending;
+    GuiFix            fFix;
+    PosSatProgress    fProgRow;
+    std::vector<gps::AcqResult> fAcqResults;
+    GuiTrackedChannel fTrackedCh;
+
+    void status(const String& s) { fPending = s; Synchronize(doStatus); }
+    void __fastcall doStatus()        { fForm->Status(fPending); }
+    void __fastcall doReset()         { fForm->resetPositionTable(); }
+    void __fastcall doAddSat()        { fForm->addPosSat(fProgRow); }
+    void __fastcall doApply()         { fForm->applyFix(fFix); }
+    void __fastcall doStopped()       { fForm->streamStopped(); }
+    void __fastcall doShowAcq()       { fForm->showAcqResults(fAcqResults); }
+    void __fastcall doResetTracking() { fForm->resetTracking(); }
+    void __fastcall doAddTracked()    { fForm->addTrackedChannel(fTrackedCh); }
+
+    void runPass(std::ifstream& f, long long offset, std::vector<std::int8_t>& buf);
+};
+
+void __fastcall TStreamThread::Execute()
+{
+    std::ifstream f(AnsiString(fFile).c_str(), std::ios::binary);
+    if (!f) { status(L"ERROR: cannot open the stream source file.");
+              Synchronize(doStopped); return; }
+    f.seekg(0, std::ios::end);
+    const long long fileLen = (long long)f.tellg();
+
+    const int n = (int)std::lround(fCfg.fs * 1.0e-3);
+    const long long need = (long long)(fTrackMs + 2) * n;
+    if (need >= fileLen) {
+        status(L"ERROR: stream source too short for the integration window.");
+        Synchronize(doStopped); return;
+    }
+
+    // One big sample buffer, reused across passes (instead of reallocating ~1.3
+    // GB every pass).
+    std::vector<std::int8_t> buf;
+    try { buf.resize((std::size_t)need); }
+    catch (...) { status(L"ERROR: out of memory for the stream buffer.");
+                  Synchronize(doStopped); return; }
+
+    status(L"Streaming from DAC (simulated): continuous acquire / track / fix. Click Stop to end.");
+
+    const long long step = (long long)(fTrackMs / 4) * n;   // advance ~1/4 window per pass
+    long long offset = 0;
+    while (!fStop && !Terminated) {
+        ++fIter;
+        runPass(f, offset, buf);
+        offset += step;
+        if (offset + need > fileLen) offset = 0;            // wrap -> loop the file
+        for (int s = 0; s < 8 && !fStop && !Terminated; ++s) ::Sleep(100);   // interruptible pause
+    }
+    status(L"Streaming stopped.");
+    Synchronize(doStopped);
+}
+
+void TStreamThread::runPass(std::ifstream& f, long long offset, std::vector<std::int8_t>& buf)
+{
+    gps::TrackConfig tcfg; tcfg.fs = fCfg.fs; tcfg.ifFreq = fCfg.ifFreq;
+    gps::AcqConfig   rcfg; rcfg.fs = tcfg.fs; rcfg.ifFreq = tcfg.ifFreq;
+    const int n = (int)std::lround(tcfg.fs * 1.0e-3);
+
+    // --- acquire at this offset (re-acquire every pass) ---
+    std::vector<std::int8_t> acq((std::size_t)n * fCfg.numMs);
+    f.clear(); f.seekg((std::streamoff)offset, std::ios::beg);
+    f.read(reinterpret_cast<char*>(acq.data()), (std::streamsize)acq.size());
+    if ((std::size_t)f.gcount() < acq.size()) return;
+    std::vector<gps::AcqResult> results = gps::acquireAll(acq.data(), acq.size(), fCfg);
+    std::vector<gps::AcqResult> found;
+    for (std::size_t i = 0; i < results.size(); ++i)
+        if (results[i].found) found.push_back(results[i]);
+
+    { char b[100]; std::snprintf(b, sizeof(b),
+          "[stream #%d] %d satellites in view; tracking...", fIter, (int)found.size());
+      status(String(b)); }
+    fAcqResults = results;
+    Synchronize(doShowAcq);          // fill the Acquisition-tab bar chart
+    Synchronize(doResetTracking);    // clear the Tracking tab for this pass
+    Synchronize(doReset);            // clear the Position table for this pass
+    if (found.size() < 4) { status(L"  fewer than 4 in view this pass - waiting."); return; }
+
+    // --- read the integration window into the shared buffer at this offset ---
+    const std::size_t need = (std::size_t)(fTrackMs + 2) * n;
+    if (buf.size() < need) return;                           // safety (buffer sized in Execute)
+    f.clear(); f.seekg((std::streamoff)offset, std::ios::beg);
+    f.read(reinterpret_cast<char*>(buf.data()), (std::streamsize)need);
+    const std::size_t got = (std::size_t)f.gcount();
+
+    // --- parallel track + decode (same machinery as the single Compute Fix) ---
+    const int N = (int)found.size();
+    std::vector<PerSat>         out((std::size_t)N);
+    std::atomic<int>            nextJob(0), doneCount(0);
+    std::mutex                  mu;
+    std::vector<String>            mq;
+    std::vector<PosSatProgress>    rq;
+    std::vector<GuiTrackedChannel> tq;
+    auto pushSat = [&](const String& s, const PosSatProgress& p) {
+        std::lock_guard<std::mutex> g(mu); mq.push_back(s); rq.push_back(p);
+    };
+    auto pushSatTracked = [&](const String& s, const PosSatProgress& p, GuiTrackedChannel& gc) {
+        std::lock_guard<std::mutex> g(mu); mq.push_back(s); rq.push_back(p); tq.push_back(std::move(gc));
+    };
+    auto worker = [&]() {
+        for (;;) {
+            if (fStop || Terminated) break;
+            const int k = nextJob.fetch_add(1);
+            if (k >= N) break;
+            const gps::AcqResult& a = found[(std::size_t)k];
+            PosSatProgress prog; prog.prn = a.prn;
+            const std::size_t off = (std::size_t)a.codePhaseSamp;
+            if (off >= got) {
+                prog.state = 0;
+                pushSat(String(L"    PRN ") + IntToStr(a.prn) + L": no data", prog);
+                doneCount.fetch_add(1); continue;
+            }
+            const std::int8_t* sp = buf.data() + off;
+            const std::size_t  sl = got - off;
+            const double fd = gps::refineDoppler(sp, sl, a.prn, a.doppler, rcfg);
+            gps::TrackChannel ch(a.prn, fd, tcfg);
+            std::vector<gps::TrackEpoch> ep = ch.run(sp, sl, fTrackMs);
+
+            // Channel stats for the Tracking-tab grid + lock indicator (mirrors the
+            // single-track worker): mean Doppler, I/Q power ratio, Doppler span.
+            const int Nn = (int)ep.size();
+            const int s0 = (Nn > 100) ? 100 : 0;
+            double sIP = 0, sQP = 0, dMin = 1e9, dMax = -1e9, dSum = 0; int m = 0;
+            for (int i = s0; i < Nn; ++i) {
+                sIP += std::fabs(ep[i].iP); sQP += std::fabs(ep[i].qP);
+                const double d = ep[i].doppler; dSum += d;
+                if (d < dMin) dMin = d; if (d > dMax) dMax = d; ++m;
+            }
+            const double finalDop = m ? dSum / m : 0.0;
+            prog.doppler = finalDop;
+            const double ratio = sIP / (sQP > 0 ? sQP : 1);
+
+            gps::BitSync bs = gps::findBitSync(ep);
+            prog.cn0 = gps::estimateCN0(ep, bs.valid ? bs.offset : 0);
+            const bool locked = (m > 0) && (ratio > 3.0) && ((dMax - dMin) < 200.0) && bs.valid;
+
+            GuiTrackedChannel gc;
+            gc.prn = a.prn; gc.finalDoppler = finalDop; gc.avgCn0 = prog.cn0; gc.locked = locked;
+            gc.epochs = ep;     // copy for the Tracking-tab plots (ep is moved into the fix below)
+
+            if (!bs.valid) {
+                prog.state = 1;
+                pushSatTracked(String(L"    PRN ") + IntToStr(a.prn) + L": no bit sync", prog, gc);
+                doneCount.fetch_add(1); continue;
+            }
+            std::vector<int> bits = gps::demodulateBits(ep, bs.offset);
+            gps::NavDecode nd = gps::decodeNav(bits, a.prn);
+            prog.state = nd.eph.valid ? 3 : 2;
+            pushSatTracked(String(L"    PRN ") + IntToStr(a.prn) +
+                    (nd.eph.valid ? L": ephemeris OK" : L": ephemeris incomplete"), prog, gc);
+            if (nd.eph.valid) {
+                PvtChan c;
+                c.prn = a.prn; c.codePhaseSamp = a.codePhaseSamp; c.bitOffset = bs.offset;
+                c.eph = nd.eph; c.ep = std::move(ep); c.subs = nd.subframes;
+                out[(std::size_t)k].chan = std::move(c);
+                out[(std::size_t)k].valid = true;
+            }
+            doneCount.fetch_add(1);
+        }
+    };
+
+    unsigned hw = std::thread::hardware_concurrency();
+    int nW = N; if (hw && nW > (int)hw) nW = (int)hw;
+    std::vector<std::thread> pool; pool.reserve((std::size_t)nW);
+    for (int i = 0; i < nW; ++i) pool.emplace_back(worker);
+
+    auto drain = [&]() {
+        std::vector<String> ms; std::vector<PosSatProgress> rs; std::vector<GuiTrackedChannel> ts;
+        { std::lock_guard<std::mutex> g(mu); ms.swap(mq); rs.swap(rq); ts.swap(tq); }
+        for (std::size_t i = 0; i < ms.size(); ++i) status(ms[i]);
+        for (std::size_t i = 0; i < rs.size(); ++i) { fProgRow = rs[i]; Synchronize(doAddSat); }
+        for (std::size_t i = 0; i < ts.size(); ++i) { fTrackedCh = std::move(ts[i]); Synchronize(doAddTracked); }
+    };
+    while (doneCount.load() < N && !fStop && !Terminated) { ::Sleep(120); drain(); }
+    for (std::size_t i = 0; i < pool.size(); ++i) pool[i].join();
+    drain();
+
+    if (fStop || Terminated) return;
+
+    std::vector<PvtChan> chans;
+    for (int k = 0; k < N; ++k)
+        if (out[(std::size_t)k].valid) chans.push_back(std::move(out[(std::size_t)k].chan));
+    if (chans.size() < 4) { status(L"  fewer than 4 full ephemerides this pass."); return; }
+
+    fFix = solveFixFromChannels(chans, tcfg.fs);
+    if (!fFix.ok) { status(L"  could not align >= 4 channels this pass."); return; }
+    Synchronize(doApply);
+    { char b[120]; std::snprintf(b, sizeof(b),
+          "[stream #%d] FIX: Lat %.6f, Lon %.6f, Alt %.0f m  (%d sats, GDOP %.2f)",
+          fIter, fFix.lat, fFix.lon, fFix.alt, fFix.nSats, fFix.gdop); status(String(b)); }
+}
+
+//---------------------------------------------------------------------------
+void __fastcall TMainForm::btnStreamClick(TObject* Sender)
+{
+    if (FStream) {                                  // already streaming -> stop
+        static_cast<TStreamThread*>(FStream)->requestStop();
+        FbtnStream->Enabled = false;
+        FbtnStream->Caption = L"Stopping...";
+        return;
+    }
+    if (FFilePath.IsEmpty()) {
+        Status(L"Open a capture first (it stands in for the live DAC stream).");
+        return;
+    }
+
+    PageControl1->ActivePage = tsPosition;          // jump to the Position tab
+    buildPositionSky();
+    resetPositionTable();
+    memoFix->Clear();
+    FSkyRows.clear(); if (FchSky) FchSky->Repaint();
+
+    btnAcquire->Enabled = false;                    // no manual ops while streaming
+    btnTrack->Enabled   = false;
+    btnFix->Enabled     = false;
+
+    gps::AcqConfig cfg;
+    cfg.fs = FDacSampleRate; cfg.ifFreq = FIfHz;
+    cfg.numMs = 2; cfg.dopplerStep = 500.0; cfg.threshold = 2.5;
+
+    Status(L"Stream from DAC starting (simulated from " + ExtractFileName(FFilePath) + L")...");
+    { char b[90]; std::snprintf(b, sizeof(b), "  DAC %.3f MHz, IF %.3f MHz, 36 s integration per pass.",
+          FDacSampleRate / 1e6, FIfHz / 1e6); Status(String(b)); }
+
+    FbtnStream->Caption = L"Stop Streaming";
+    TStreamThread* w = new TStreamThread(this, FFilePath, cfg, 36000);
+    FStream = w;
+    w->Start();
+}
+
+//---------------------------------------------------------------------------
+void TMainForm::streamStopped()
+{
+    FStream = NULL;
+    FbtnStream->Caption = L"Stream from DAC";
+    FbtnStream->Enabled = true;
+    btnAcquire->Caption = L"Acquire";        btnAcquire->Enabled = true;
+    btnTrack->Caption   = L"Track Acquired"; btnTrack->Enabled   = true;
+    btnFix->Caption     = L"Compute Fix";    btnFix->Enabled     = true;
 }
 //---------------------------------------------------------------------------
