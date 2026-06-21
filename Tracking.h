@@ -19,6 +19,7 @@
 #include <vector>
 #include <cstdint>
 #include <cstddef>
+#include <atomic>
 
 namespace gps {
 
@@ -54,8 +55,10 @@ public:
     // Track 'numMs' integration periods from a contiguous int8 stream that the
     // caller has aligned to the satellite's code phase (i.e. sig[0] is the start
     // of a code period). Returns one TrackEpoch per period actually processed
-    // (fewer than numMs if the stream runs out).
-    std::vector<TrackEpoch> run(const std::int8_t* sig, std::size_t numSamples, int numMs);
+    // (fewer than numMs if the stream runs out). If 'abort' is given and becomes
+    // true, tracking stops early (used for responsive shutdown of long runs).
+    std::vector<TrackEpoch> run(const std::int8_t* sig, std::size_t numSamples, int numMs,
+                                const std::atomic<bool>* abort = nullptr);
 
     int prn() const { return prn_; }
 

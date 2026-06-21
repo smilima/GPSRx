@@ -48,7 +48,8 @@ TrackChannel::TrackChannel(int prn, double dopplerHz, const TrackConfig& cfg)
 }
 
 std::vector<TrackEpoch> TrackChannel::run(const std::int8_t* sig,
-                                          std::size_t numSamples, int numMs)
+                                          std::size_t numSamples, int numMs,
+                                          const std::atomic<bool>* abort)
 {
     std::vector<TrackEpoch> out;
     out.reserve((std::size_t)numMs);
@@ -57,6 +58,7 @@ std::vector<TrackEpoch> TrackChannel::run(const std::int8_t* sig,
     std::size_t idx = 0;
 
     for (int ms = 0; ms < numMs; ++ms) {
+        if (abort && abort->load(std::memory_order_relaxed)) break;   // responsive shutdown
         const double codePhaseStep = codeFreq_ / cfg_.fs;       // chips per sample
         const int blksize =
             (int)std::ceil((CA_CODE_LENGTH - remCodePhase_) / codePhaseStep);

@@ -12,6 +12,15 @@ object MainForm: TMainForm
   Font.Style = []
   Menu = MainMenu1
   TextHeight = 15
+  object Splitter1: TSplitter
+    Left = 0
+    Top = 433
+    Width = 975
+    Height = 5
+    Cursor = crVSplit
+    Align = alTop
+    MinSize = 120
+  end
   object memoResults: TMemo
     Left = 0
     Top = 438
@@ -62,6 +71,9 @@ object MainForm: TMainForm
     TabOrder = 2
     object tsAcquisition: TTabSheet
       Caption = 'Aquisition'
+      DesignSize = (
+        967
+        362)
       object btnAcquire: TButton
         Left = 8
         Top = 8
@@ -82,8 +94,8 @@ object MainForm: TMainForm
           'TChart')
         Title.Visible = False
         View3D = False
-        Anchors = [akLeft, akTop, akRight, akBottom]
         TabOrder = 1
+        Anchors = [akLeft, akTop, akRight, akBottom]
         DefaultCanvas = 'TGDIPlusCanvas'
         ColorPaletteIndex = 13
         object Series1: TBarSeries
@@ -98,6 +110,9 @@ object MainForm: TMainForm
     object tsTracking: TTabSheet
       Caption = 'Tracking'
       ImageIndex = 1
+      DesignSize = (
+        967
+        362)
       object btnTrack: TButton
         Left = 8
         Top = 8
@@ -131,6 +146,9 @@ object MainForm: TMainForm
     object tsPosition: TTabSheet
       Caption = 'Position'
       ImageIndex = 2
+      DesignSize = (
+        967
+        362)
       object btnFix: TButton
         Left = 8
         Top = 8
@@ -146,7 +164,6 @@ object MainForm: TMainForm
         Width = 462
         Height = 312
         Anchors = [akLeft, akTop, akBottom]
-        ColCount = 5
         DefaultColWidth = 90
         DefaultRowHeight = 22
         FixedCols = 0
@@ -177,17 +194,6 @@ object MainForm: TMainForm
         TabOrder = 2
       end
     end
-  end
-  object Splitter1: TSplitter
-    Left = 0
-    Top = 433
-    Width = 975
-    Height = 5
-    Cursor = crVSplit
-    Align = alTop
-    MinSize = 120
-    ExplicitTop = 433
-    ExplicitWidth = 975
   end
   object MainMenu1: TMainMenu
     Left = 512

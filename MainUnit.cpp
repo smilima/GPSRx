@@ -206,6 +206,7 @@ __fastcall TMainForm::TMainForm(TComponent* Owner)
 
     // --- DAC streaming + settings ---
     FStream = NULL;
+    FDeadStream = NULL;
     loadSettings();                                  // fills FDacSampleRate / FIfHz from GPSRx.ini
 
     // View -> Settings menu (built at runtime, so no .dfm edit is needed).
@@ -1252,9 +1253,10 @@ public:
         : TThread(true), fForm(AForm), fFile(AFile), fCfg(ACfg),
           fTrackMs(ATrackMs), fStop(false), fIter(0)
     {
-        FreeOnTerminate = true;
+        FreeOnTerminate = false;   // owner stops + WaitFor + deletes (see streamDone / ~TMainForm)
     }
     void requestStop() { fStop = true; }
+    const std::atomic<bool>& stopFlag() const { return fStop; }
 
 protected:
     void __fastcall Execute();
@@ -1277,7 +1279,6 @@ private:
     void __fastcall doReset()         { fForm->resetPositionTable(); }
     void __fastcall doAddSat()        { fForm->addPosSat(fProgRow); }
     void __fastcall doApply()         { fForm->applyFix(fFix); }
-    void __fastcall doStopped()       { fForm->streamStopped(); }
     void __fastcall doShowAcq()       { fForm->showAcqResults(fAcqResults); }
     void __fastcall doResetTracking() { fForm->resetTracking(); }
     void __fastcall doAddTracked()    { fForm->addTrackedChannel(fTrackedCh); }
@@ -1287,9 +1288,10 @@ private:
 
 void __fastcall TStreamThread::Execute()
 {
+    // Execute just returns when finished/aborted; the OnTerminate handler
+    // (TMainForm::streamDone) resets the GUI and manages this thread's lifetime.
     std::ifstream f(AnsiString(fFile).c_str(), std::ios::binary);
-    if (!f) { status(L"ERROR: cannot open the stream source file.");
-              Synchronize(doStopped); return; }
+    if (!f) { status(L"ERROR: cannot open the stream source file."); return; }
     f.seekg(0, std::ios::end);
     const long long fileLen = (long long)f.tellg();
 
@@ -1297,15 +1299,14 @@ void __fastcall TStreamThread::Execute()
     const long long need = (long long)(fTrackMs + 2) * n;
     if (need >= fileLen) {
         status(L"ERROR: stream source too short for the integration window.");
-        Synchronize(doStopped); return;
+        return;
     }
 
     // One big sample buffer, reused across passes (instead of reallocating ~1.3
     // GB every pass).
     std::vector<std::int8_t> buf;
     try { buf.resize((std::size_t)need); }
-    catch (...) { status(L"ERROR: out of memory for the stream buffer.");
-                  Synchronize(doStopped); return; }
+    catch (...) { status(L"ERROR: out of memory for the stream buffer."); return; }
 
     status(L"Streaming from DAC (simulated): continuous acquire / track / fix. Click Stop to end.");
 
@@ -1319,7 +1320,6 @@ void __fastcall TStreamThread::Execute()
         for (int s = 0; s < 8 && !fStop && !Terminated; ++s) ::Sleep(100);   // interruptible pause
     }
     status(L"Streaming stopped.");
-    Synchronize(doStopped);
 }
 
 void TStreamThread::runPass(std::ifstream& f, long long offset, std::vector<std::int8_t>& buf)
@@ -1385,7 +1385,8 @@ void TStreamThread::runPass(std::ifstream& f, long long offset, std::vector<std:
             const std::size_t  sl = got - off;
             const double fd = gps::refineDoppler(sp, sl, a.prn, a.doppler, rcfg);
             gps::TrackChannel ch(a.prn, fd, tcfg);
-            std::vector<gps::TrackEpoch> ep = ch.run(sp, sl, fTrackMs);
+            std::vector<gps::TrackEpoch> ep = ch.run(sp, sl, fTrackMs, &fStop);
+            if (fStop || Terminated) { doneCount.fetch_add(1); continue; }  // aborted -> skip
 
             // Channel stats for the Tracking-tab grid + lock indicator (mirrors the
             // single-track worker): mean Doppler, I/Q power ratio, Doppler span.
@@ -1493,8 +1494,11 @@ void __fastcall TMainForm::btnStreamClick(TObject* Sender)
     { char b[90]; std::snprintf(b, sizeof(b), "  DAC %.3f MHz, IF %.3f MHz, 36 s integration per pass.",
           FDacSampleRate / 1e6, FIfHz / 1e6); Status(String(b)); }
 
+    if (FDeadStream) { delete FDeadStream; FDeadStream = NULL; }   // reap the previous worker
+
     FbtnStream->Caption = L"Stop Streaming";
     TStreamThread* w = new TStreamThread(this, FFilePath, cfg, 36000);
+    w->OnTerminate = streamDone;
     FStream = w;
     w->Start();
 }
@@ -1502,11 +1506,42 @@ void __fastcall TMainForm::btnStreamClick(TObject* Sender)
 //---------------------------------------------------------------------------
 void TMainForm::streamStopped()
 {
-    FStream = NULL;
     FbtnStream->Caption = L"Stream from DAC";
     FbtnStream->Enabled = true;
     btnAcquire->Caption = L"Acquire";        btnAcquire->Enabled = true;
     btnTrack->Caption   = L"Track Acquired"; btnTrack->Enabled   = true;
     btnFix->Caption     = L"Compute Fix";    btnFix->Enabled     = true;
+}
+
+//---------------------------------------------------------------------------
+// OnTerminate for the stream worker (fires on the main thread after Execute
+// returns - for Stop, an error, or shutdown). Resets the GUI and parks the
+// (non-FreeOnTerminate) thread object in FDeadStream for deferred deletion: a
+// thread cannot delete itself from within its own OnTerminate.
+void __fastcall TMainForm::streamDone(TObject* Sender)
+{
+    if (FStream == Sender) FStream = NULL;
+    if (FDeadStream && FDeadStream != Sender) delete FDeadStream;  // reap the prior finished worker
+    FDeadStream = static_cast<TThread*>(Sender);
+    streamStopped();
+}
+
+//---------------------------------------------------------------------------
+__fastcall TMainForm::~TMainForm()
+{
+    // Stop + wait for the stream worker before the form (and its GUI) is torn
+    // down, so it can never Synchronize to a destroyed form. The abort flag makes
+    // the in-flight track bail within a ms; WaitFor() on the main thread keeps
+    // pumping Synchronize so there is no deadlock. OnTerminate is cleared first so
+    // streamDone does not run mid-teardown.
+    if (FStream) {
+        TStreamThread* s = static_cast<TStreamThread*>(FStream);
+        s->OnTerminate = NULL;     // streamDone must not run during teardown
+        s->requestStop();
+        s->WaitFor();              // fast (abort flag); pumps Synchronize -> no deadlock
+        delete s;
+        FStream = NULL;            // clear only after the worker is fully gone
+    }
+    if (FDeadStream) { delete FDeadStream; FDeadStream = NULL; }
 }
 //---------------------------------------------------------------------------

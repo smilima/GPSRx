@@ -126,12 +126,15 @@ private:	// User declarations
 	double           FIfHz;          // Hz  (intermediate frequency -> ifFreq)
 	TButton*         FbtnStream;     // runtime "Stream from DAC" button on Panel1
 	TThread*         FStream;        // running continuous-receiver worker (NULL when idle)
+	TThread*         FDeadStream;    // finished stream worker awaiting deletion (not FreeOnTerminate)
 	void loadSettings();
 	void saveSettings();
 	void __fastcall settingsClick(TObject* Sender);
 	void __fastcall btnStreamClick(TObject* Sender);
+	void __fastcall streamDone(TObject* Sender);   // stream worker OnTerminate handler
 public:		// User declarations
 	__fastcall TMainForm(TComponent* Owner);
+	__fastcall ~TMainForm();
 	// Called from worker threads via Synchronize (main thread):
 	void Status(const String& s);                                   // append one status line to the memo
 	void beginAcquisition();                                        // clear the chart for a new sky search
