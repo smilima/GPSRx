@@ -19,6 +19,7 @@
 #include <vector>
 #include "Acquisition.h"
 #include "Tracking.h"
+#include "NavMessage.h"
 //---------------------------------------------------------------------------
 // One tracked satellite's results for the Tracking-tab display.
 struct GuiTrackedChannel {
@@ -60,6 +61,20 @@ struct PosSatProgress {
 	double cn0 = 0;       // dB-Hz
 	double doppler = 0;   // Hz
 	int    state = 0;     // 0 no-data, 1 no-sync, 2 eph-incomplete, 3 eph-OK
+};
+//---------------------------------------------------------------------------
+// Per-PRN data captured by the Advanced "Analyze" pass, for the inspector popups.
+struct AdvPrn {
+	int       prn = 0;
+	bool      valid = false;
+	long long codePhaseSamp = 0;
+	int       bitOffset = 0;
+	double    doppler = 0;
+	double    cn0 = 0;
+	std::vector<gps::TrackEpoch> epochs;   // full 36 s tracking telemetry
+	std::vector<int>             bits;      // demodulated 50 bps stream
+	gps::NavDecode               nav;       // ephemeris + subframe refs
+	gps::NavDetail               detail;    // per-word/parity breakdown
 };
 //---------------------------------------------------------------------------
 class TMainForm : public TForm
@@ -132,6 +147,49 @@ private:	// User declarations
 	void __fastcall settingsClick(TObject* Sender);
 	void __fastcall btnStreamClick(TObject* Sender);
 	void __fastcall streamDone(TObject* Sender);   // stream worker OnTerminate handler
+
+	// --- Advanced inspection suite ---
+	TCheckBox*          FchkAdvanced;
+	TTabSheet*          tsAdvanced;
+	TButton*            FbtnAnalyze;
+	TLabel*             FlblAdv;
+	TThread*            FAdvThread;     // running Analyze worker (NULL when idle)
+	TThread*            FAdvDead;       // finished Analyze worker awaiting deletion
+	std::vector<AdvPrn> FAdv;           // per analyzed PRN
+	gps::AlmanacSet     FAdvAlmanac;
+	GuiFix              FAdvFix;
+	bool                FAdvReady;
+	std::vector<TButton*> FAdvButtons;  // inspector launch buttons (enabled after Analyze)
+	// interactive inspector controls (one popup of each kind at a time)
+	TComboBox*  FcodePrnA;  TComboBox* FcodePrnB;  TChart* FcodeChart;  TChart* FcorrChart;  TLabel* FcodeLbl;
+	TComboBox*  FnavPrn;     TStringGrid* FnavSubs; TStringGrid* FnavWords; TMemo* FnavDump;
+	TComboBox*  FephPrn;     TStringGrid* FephGrid; TMemo* FephMemo;
+	TComboBox*  FtrkPrn;     TChart* FtrkIQ; TChart* FtrkDisc; TChart* FtrkObs; TLabel* FtrkLbl;
+	TComboBox*  FacqPrn;     TImage* FacqImg; TChart* FacqCode; TChart* FacqDop; TLabel* FacqLbl;
+	TChart*     FrfTime;     TChart* FrfPsd;  TLabel* FrfLbl;
+
+	void __fastcall advCheckClick(TObject* Sender);
+	void __fastcall advAnalyzeClick(TObject* Sender);
+	void __fastcall advDone(TObject* Sender);          // Analyze worker OnTerminate
+	void __fastcall inspectorClose(TObject* Sender, TCloseAction& Action);
+	TForm* makeInspector(const String& title, int w, int h);
+	const AdvPrn* advFind(int prn) const;
+	void advFillPrnCombo(TComboBox* cb, bool ephemerisOnly);
+	void __fastcall advCodeClick(TObject* Sender);     // C/A code & correlation
+	void __fastcall advNavClick(TObject* Sender);      // nav frame & bits
+	void __fastcall advEphClick(TObject* Sender);      // ephemeris decoder
+	void __fastcall advAlmClick(TObject* Sender);      // almanac & SF4/5
+	void __fastcall advTrackClick(TObject* Sender);    // tracking loops lab
+	void __fastcall advPvtClick(TObject* Sender);      // PVT solver lab
+	void __fastcall advAcqClick(TObject* Sender);      // acquisition search surface
+	void __fastcall advRfClick(TObject* Sender);       // RF & spectrum
+	void __fastcall advJourneyClick(TObject* Sender);  // signal journey overview
+	void __fastcall advCodeChange(TObject* Sender);
+	void __fastcall advNavChange(TObject* Sender);
+	void __fastcall advEphChange(TObject* Sender);
+	void __fastcall advTrackChange(TObject* Sender);
+	void __fastcall advAcqChange(TObject* Sender);
+	bool advReadIF(std::vector<signed char>& out, int maxSamples); // first samples of the capture
 public:		// User declarations
 	__fastcall TMainForm(TComponent* Owner);
 	__fastcall ~TMainForm();

@@ -225,6 +225,59 @@ __fastcall TMainForm::TMainForm(TComponent* Owner)
     FbtnStream->SetBounds(editFile->Left + editFile->Width + 12, editFile->Top - 2, 130, 27);
     FbtnStream->OnClick = btnStreamClick;
 
+    // --- Advanced inspection: "Advanced" checkbox + a hidden tab of inspectors ---
+    FAdvThread = NULL; FAdvDead = NULL; FAdvReady = false;
+    FchkAdvanced = new TCheckBox(this);
+    FchkAdvanced->Parent  = Panel1;
+    FchkAdvanced->Caption = L"Advanced";
+    FchkAdvanced->SetBounds(FbtnStream->Left + FbtnStream->Width + 16, editFile->Top + 2, 90, 21);
+    FchkAdvanced->OnClick = advCheckClick;
+
+    tsAdvanced = new TTabSheet(PageControl1);
+    tsAdvanced->PageControl = PageControl1;
+    tsAdvanced->Caption     = L"Advanced";
+    tsAdvanced->TabVisible  = false;
+
+    FlblAdv = new TLabel(this);
+    FlblAdv->Parent = tsAdvanced;
+    FlblAdv->SetBounds(10, 8, 940, 44);
+    FlblAdv->AutoSize = false; FlblAdv->WordWrap = true;
+    FlblAdv->Caption =
+        L"GPS signal inspection lab - teaching views of every receiver stage.  "
+        L"Journey / RF / Acquisition / C-A Code work straight from the open capture; "
+        L"the rest (Tracking, Nav, Ephemeris, Almanac, PVT) need \"Analyze\", which tracks + "
+        L"decodes every acquired satellite for ~30 s and then enables them.";
+
+    FbtnAnalyze = new TButton(this);
+    FbtnAnalyze->Parent = tsAdvanced;
+    FbtnAnalyze->SetBounds(10, 56, 230, 30);
+    FbtnAnalyze->Caption = L"Analyze (track + decode all)";
+    FbtnAnalyze->OnClick = advAnalyzeClick;
+
+    {
+        int idx = 0;
+        // (caption, handler, needsAnalysis)
+        struct Item { const wchar_t* cap; TNotifyEvent ev; bool needData; };
+        auto add = [&](const String& cap, TNotifyEvent ev, bool needData) {
+            TButton* b = new TButton(this);
+            b->Parent = tsAdvanced;
+            b->SetBounds(10, 100 + idx * 34, 230, 28);
+            b->Caption = cap;
+            b->OnClick = ev;
+            if (needData) { b->Enabled = false; FAdvButtons.push_back(b); }
+            ++idx;
+        };
+        add(L"Signal Journey Overview", advJourneyClick, false);
+        add(L"RF && Spectrum",          advRfClick,      false);
+        add(L"Acquisition Search Surface", advAcqClick,  false);
+        add(L"C/A Code && Correlation", advCodeClick,  false);
+        add(L"Tracking Loops Lab",      advTrackClick, true);
+        add(L"Nav Frame && Bits",       advNavClick,   true);
+        add(L"Ephemeris Decoder",       advEphClick,   true);
+        add(L"Almanac && SF4/5 Pages",  advAlmClick,   true);
+        add(L"PVT Solver Lab",          advPvtClick,   true);
+    }
+
     Status(L"Ready. Open a .bin or .sim capture from File > Open, then click Acquire.");
 }
 //---------------------------------------------------------------------------
@@ -1543,5 +1596,969 @@ __fastcall TMainForm::~TMainForm()
         FStream = NULL;            // clear only after the worker is fully gone
     }
     if (FDeadStream) { delete FDeadStream; FDeadStream = NULL; }
+    if (FAdvThread) {
+        TThread* a = FAdvThread; FAdvThread = NULL;
+        a->OnTerminate = NULL;
+        // TAdvThread has requestStop(); cast is safe (defined below in this unit)
+        // but to avoid an incomplete-type forward ref here we just terminate+wait.
+        a->Terminate();
+        a->WaitFor();
+        delete a;
+    }
+    if (FAdvDead) { delete FAdvDead; FAdvDead = NULL; }
+}
+
+//===========================================================================
+// Advanced inspection suite
+//===========================================================================
+static int comboPrn(TComboBox* cb)
+{
+    if (!cb || cb->ItemIndex < 0) return 0;
+    return (int)(NativeInt)cb->Items->Objects[cb->ItemIndex];
+}
+
+// Worker that tracks + decodes every acquired satellite and caches the full
+// per-PRN telemetry/nav detail + almanac + fix for the inspector popups. Mirrors
+// the Compute-Fix worker but RETAINS everything. FreeOnTerminate=false; results
+// are pulled by TMainForm::advDone (its OnTerminate) on the main thread.
+class TAdvThread : public TThread
+{
+public:
+    __fastcall TAdvThread(TMainForm* AForm, const String& AFile,
+                          const std::vector<gps::AcqResult>& ASats,
+                          const gps::AcqConfig& ACfg, int ATrackMs)
+        : TThread(true), fForm(AForm), fFile(AFile), fSats(ASats),
+          fCfg(ACfg), fTrackMs(ATrackMs)
+    {
+        FreeOnTerminate = false;
+    }
+    std::vector<AdvPrn> result;     // pulled by advDone on the main thread
+    gps::AlmanacSet     almanac;
+    GuiFix              fix;
+    bool                ok = false;
+
+protected:
+    void __fastcall Execute();
+
+private:
+    TMainForm*                  fForm;
+    String                      fFile;
+    std::vector<gps::AcqResult> fSats;
+    gps::AcqConfig              fCfg;
+    int                         fTrackMs;
+    String                      fPending;
+    void status(const String& s) { fPending = s; Synchronize(doStatus); }
+    void __fastcall doStatus()   { fForm->Status(fPending); }
+};
+
+void __fastcall TAdvThread::Execute()
+{
+    std::ifstream f(AnsiString(fFile).c_str(), std::ios::binary);
+    if (!f) { status(L"Advanced: cannot open file."); return; }
+
+    gps::TrackConfig tcfg; tcfg.fs = fCfg.fs; tcfg.ifFreq = fCfg.ifFreq;
+    gps::AcqConfig   rcfg; rcfg.fs = tcfg.fs; rcfg.ifFreq = tcfg.ifFreq;
+    const int n = (int)std::lround(tcfg.fs * 1.0e-3);
+
+    std::size_t maxOff = 0;
+    for (std::size_t k = 0; k < fSats.size(); ++k)
+        if ((std::size_t)fSats[k].codePhaseSamp > maxOff) maxOff = (std::size_t)fSats[k].codePhaseSamp;
+    const std::size_t need = (std::size_t)(fTrackMs + 2) * n;
+    const std::size_t bufLen = need + maxOff;
+    std::vector<std::int8_t> buf;
+    try { buf.resize(bufLen); } catch (...) { status(L"Advanced: out of memory."); return; }
+    f.seekg(0, std::ios::beg);
+    f.read(reinterpret_cast<char*>(buf.data()), (std::streamsize)bufLen);
+    const std::size_t got = (std::size_t)f.gcount();
+
+    const int N = (int)fSats.size();
+    std::vector<AdvPrn>  out((std::size_t)N);
+    std::atomic<int>     nextJob(0), doneCount(0);
+    std::mutex           mu;
+    std::vector<String>  mq;
+    auto worker = [&]() {
+        for (;;) {
+            if (Terminated) break;
+            const int k = nextJob.fetch_add(1);
+            if (k >= N) break;
+            const gps::AcqResult& a = fSats[(std::size_t)k];
+            const std::size_t off = (std::size_t)a.codePhaseSamp;
+            if (off >= got) { doneCount.fetch_add(1); continue; }
+            const std::int8_t* sp = buf.data() + off;
+            const std::size_t  sl = got - off;
+            const double fd = gps::refineDoppler(sp, sl, a.prn, a.doppler, rcfg);
+            gps::TrackChannel ch(a.prn, fd, tcfg);
+            std::vector<gps::TrackEpoch> ep = ch.run(sp, sl, fTrackMs, NULL);
+            if (Terminated) { doneCount.fetch_add(1); continue; }
+
+            AdvPrn ap;
+            ap.prn = a.prn; ap.codePhaseSamp = a.codePhaseSamp;
+            if (!ep.empty()) {
+                std::size_t s0 = ep.size() * 9 / 10; double ds = 0; int dc = 0;
+                for (std::size_t i = s0; i < ep.size(); ++i) { ds += ep[i].doppler; ++dc; }
+                ap.doppler = dc ? ds / dc : 0.0;
+            }
+            gps::BitSync bs = gps::findBitSync(ep);
+            ap.cn0 = gps::estimateCN0(ep, bs.valid ? bs.offset : 0);
+            ap.bitOffset = bs.valid ? bs.offset : 0;
+            ap.epochs = std::move(ep);
+            if (bs.valid) {
+                ap.bits   = gps::demodulateBits(ap.epochs, bs.offset);
+                ap.nav    = gps::decodeNav(ap.bits, a.prn);
+                ap.detail = gps::inspectNav(ap.bits, a.prn);
+                ap.valid  = true;
+            }
+            out[(std::size_t)k] = std::move(ap);
+            { char b[64]; std::snprintf(b, sizeof(b), "  analyzed PRN %d", a.prn);
+              std::lock_guard<std::mutex> g(mu); mq.push_back(String(b)); }
+            doneCount.fetch_add(1);
+        }
+    };
+    unsigned hw = std::thread::hardware_concurrency();
+    int nW = N; if (hw && nW > (int)hw) nW = (int)hw;
+    std::vector<std::thread> pool; pool.reserve((std::size_t)nW);
+    for (int i = 0; i < nW; ++i) pool.emplace_back(worker);
+    while (doneCount.load() < N && !Terminated) {
+        ::Sleep(150);
+        std::vector<String> batch;
+        { std::lock_guard<std::mutex> g(mu); batch.swap(mq); }
+        for (std::size_t i = 0; i < batch.size(); ++i) status(batch[i]);
+    }
+    for (std::size_t i = 0; i < pool.size(); ++i) pool[i].join();
+    if (Terminated) return;
+
+    std::vector<int> allBits;
+    std::vector<PvtChan> chans;
+    for (int k = 0; k < N; ++k) {
+        if (out[(std::size_t)k].prn == 0) continue;
+        if (out[(std::size_t)k].valid) {
+            for (int b : out[(std::size_t)k].bits) allBits.push_back(b);
+            if (out[(std::size_t)k].nav.eph.valid) {
+                PvtChan c;
+                c.prn = out[(std::size_t)k].prn;
+                c.codePhaseSamp = out[(std::size_t)k].codePhaseSamp;
+                c.bitOffset = out[(std::size_t)k].bitOffset;
+                c.eph  = out[(std::size_t)k].nav.eph;
+                c.ep   = out[(std::size_t)k].epochs;           // copy (solve needs sampleIndex)
+                c.subs = out[(std::size_t)k].nav.subframes;
+                chans.push_back(std::move(c));
+            }
+        }
+        result.push_back(std::move(out[(std::size_t)k]));
+    }
+    almanac = gps::decodeAlmanac(allBits);
+    if (chans.size() >= 4) fix = solveFixFromChannels(chans, tcfg.fs);
+    ok = !result.empty();
+}
+
+//---------------------------------------------------------------------------
+void __fastcall TMainForm::advCheckClick(TObject* Sender)
+{
+    tsAdvanced->TabVisible = FchkAdvanced->Checked;
+    if (FchkAdvanced->Checked) PageControl1->ActivePage = tsAdvanced;
+}
+//---------------------------------------------------------------------------
+void __fastcall TMainForm::inspectorClose(TObject* Sender, TCloseAction& Action)
+{
+    Action = caFree;
+}
+//---------------------------------------------------------------------------
+TForm* TMainForm::makeInspector(const String& title, int w, int h)
+{
+    TForm* f = new TForm(Application);
+    f->Caption  = title;
+    f->Width = w; f->Height = h;
+    f->Position = poMainFormCenter;
+    f->OnClose  = inspectorClose;
+    return f;
+}
+//---------------------------------------------------------------------------
+const AdvPrn* TMainForm::advFind(int prn) const
+{
+    for (std::size_t i = 0; i < FAdv.size(); ++i)
+        if (FAdv[i].prn == prn) return &FAdv[i];
+    return NULL;
+}
+//---------------------------------------------------------------------------
+void TMainForm::advFillPrnCombo(TComboBox* cb, bool ephemerisOnly)
+{
+    cb->Items->Clear();
+    for (std::size_t i = 0; i < FAdv.size(); ++i) {
+        if (ephemerisOnly && !FAdv[i].nav.eph.valid) continue;
+        cb->Items->AddObject(L"PRN " + IntToStr(FAdv[i].prn), (TObject*)(NativeInt)FAdv[i].prn);
+    }
+    if (cb->Items->Count > 0) cb->ItemIndex = 0;
+}
+//---------------------------------------------------------------------------
+void __fastcall TMainForm::advAnalyzeClick(TObject* Sender)
+{
+    if (FAdvThread) { Status(L"Advanced: analysis already running."); return; }
+    if (!FHaveResults)       { Status(L"Acquire satellites first (Acquisition tab)."); return; }
+    if (FFilePath.IsEmpty()) { Status(L"No file loaded."); return; }
+
+    std::vector<gps::AcqResult> found;
+    for (int prn = 1; prn <= 32; ++prn)
+        if (FResults[prn].found) found.push_back(FResults[prn]);
+    if (found.empty()) { Status(L"No acquired satellites to analyze."); return; }
+
+    if (FAdvDead) { delete FAdvDead; FAdvDead = NULL; }
+
+    gps::AcqConfig cfg = configForFile(FFilePath);
+    FbtnAnalyze->Enabled = false;
+    FbtnAnalyze->Caption = L"Analyzing...";
+    char b[100];
+    std::snprintf(b, sizeof(b), "Advanced: tracking + decoding %d satellites for inspection (~30 s)...",
+                  (int)found.size());
+    Status(String(b));
+
+    TAdvThread* w = new TAdvThread(this, FFilePath, found, cfg, 36000);
+    w->OnTerminate = advDone;
+    FAdvThread = w;
+    w->Start();
+}
+//---------------------------------------------------------------------------
+void __fastcall TMainForm::advDone(TObject* Sender)
+{
+    TAdvThread* t = static_cast<TAdvThread*>(Sender);
+    if (FAdvThread == Sender) FAdvThread = NULL;
+    if (t->ok) {
+        FAdv        = std::move(t->result);
+        FAdvAlmanac = t->almanac;
+        FAdvFix     = t->fix;
+        FAdvReady   = true;
+        for (std::size_t i = 0; i < FAdvButtons.size(); ++i) FAdvButtons[i]->Enabled = true;
+        char b[100];
+        std::snprintf(b, sizeof(b), "Advanced: analysis complete - %d satellites cached, inspectors enabled.",
+                      (int)FAdv.size());
+        Status(String(b));
+    } else {
+        Status(L"Advanced: analysis did not complete.");
+    }
+    FbtnAnalyze->Enabled = true;
+    FbtnAnalyze->Caption = L"Analyze (track + decode all)";
+    if (FAdvDead && FAdvDead != Sender) delete FAdvDead;
+    FAdvDead = static_cast<TThread*>(Sender);
+}
+
+//===========================================================================
+// Inspector: C/A Code & Correlation  (standalone - needs no analysis)
+//===========================================================================
+void __fastcall TMainForm::advCodeClick(TObject* Sender)
+{
+    TForm* f = makeInspector(L"C/A Code & Correlation", 920, 660);
+
+    TLabel* la = new TLabel(f); la->Parent = f; la->SetBounds(12, 12, 48, 20); la->Caption = L"PRN A:";
+    FcodePrnA = new TComboBox(f); FcodePrnA->Parent = f; FcodePrnA->SetBounds(60, 8, 70, 24);
+    FcodePrnA->Style = csDropDownList;
+    TLabel* lb = new TLabel(f); lb->Parent = f; lb->SetBounds(150, 12, 70, 20); lb->Caption = L"vs PRN B:";
+    FcodePrnB = new TComboBox(f); FcodePrnB->Parent = f; FcodePrnB->SetBounds(220, 8, 70, 24);
+    FcodePrnB->Style = csDropDownList;
+    for (int p = 1; p <= 32; ++p) {
+        FcodePrnA->Items->AddObject(IntToStr(p), (TObject*)(NativeInt)p);
+        FcodePrnB->Items->AddObject(IntToStr(p), (TObject*)(NativeInt)p);
+    }
+    FcodePrnA->ItemIndex = 0; FcodePrnB->ItemIndex = 1;
+    FcodePrnA->OnChange = advCodeChange; FcodePrnB->OnChange = advCodeChange;
+    FcodeLbl = new TLabel(f); FcodeLbl->Parent = f; FcodeLbl->SetBounds(310, 12, 590, 20); FcodeLbl->AutoSize = false;
+
+    FcodeChart = new TChart(f); FcodeChart->Parent = f; FcodeChart->SetBounds(12, 44, 894, 230);
+    FcodeChart->Anchors = TAnchors() << akLeft << akTop << akRight;
+    FcodeChart->View3D = false; FcodeChart->Legend->Visible = false;
+    FcodeChart->BottomAxis->Title->Caption = L"chip index"; FcodeChart->LeftAxis->Title->Caption = L"chip value";
+    TFastLineSeries* cs = new TFastLineSeries(FcodeChart); FcodeChart->AddSeries(cs);
+
+    FcorrChart = new TChart(f); FcorrChart->Parent = f; FcorrChart->SetBounds(12, 284, 894, 290);
+    FcorrChart->Anchors = TAnchors() << akLeft << akTop << akRight << akBottom;
+    FcorrChart->View3D = false; FcorrChart->Legend->Visible = true; FcorrChart->Legend->Alignment = laBottom;
+    FcorrChart->Title->Text->Text = L"Circular correlation over all 1023 code-phase lags";
+    FcorrChart->BottomAxis->Title->Caption = L"code-phase lag (chips)";
+    FcorrChart->LeftAxis->Title->Caption = L"correlation";
+    TFastLineSeries* au = new TFastLineSeries(FcorrChart); FcorrChart->AddSeries(au); au->Title = L"auto-corr(A)";
+    TFastLineSeries* xc = new TFastLineSeries(FcorrChart); FcorrChart->AddSeries(xc); xc->Title = L"cross-corr(A,B)";
+
+    TMemo* m = new TMemo(f); m->Parent = f; m->SetBounds(12, 580, 894, 44);
+    m->Anchors = TAnchors() << akLeft << akRight << akBottom; m->ReadOnly = true;
+    m->Lines->Add(L"A 1023-chip Gold code repeats every 1 ms at 1.023 Mcps (~37.33 samples/chip at 38.192 MHz). "
+                  L"Auto-correlation is a 1023-high, 1-chip-wide spike = the ~30 dB processing gain that lifts the "
+                  L"satellite out of the noise; cross-correlation between PRNs stays low and bounded (CDMA).");
+    advCodeChange(NULL);
+    f->Show();
+}
+//---------------------------------------------------------------------------
+void __fastcall TMainForm::advCodeChange(TObject* Sender)
+{
+    if (!FcodeChart || !FcorrChart) return;
+    int pa = comboPrn(FcodePrnA), pb = comboPrn(FcodePrnB);
+    if (pa < 1) pa = 1; if (pb < 1) pb = 2;
+    std::vector<std::int8_t> a = gps::generateCACode(pa);
+    std::vector<std::int8_t> b = gps::generateCACode(pb);
+    const int L = gps::CA_CODE_LENGTH;
+
+    TChartSeries* cs = FcodeChart->Series[0]; cs->Clear();
+    for (int i = 0; i < 64 && i < (int)a.size(); ++i) cs->AddXY((double)i, (double)a[i], L"", clTeeColor);
+    FcodeChart->Title->Text->Text = String(L"C/A code chips (first 64 of 1023) - PRN ") + IntToStr(pa);
+
+    TChartSeries* au = FcorrChart->Series[0]; au->Clear();
+    TChartSeries* xc = FcorrChart->Series[1]; xc->Clear();
+    int autoMax = 0, crossMax = 0;
+    for (int lag = 0; lag < L; ++lag) {
+        int sa = 0, sx = 0;
+        for (int i = 0; i < L; ++i) { int j = i + lag; if (j >= L) j -= L; sa += a[i] * a[j]; sx += a[i] * b[j]; }
+        au->AddXY((double)lag, (double)sa, L"", clTeeColor);
+        xc->AddXY((double)lag, (double)sx, L"", clTeeColor);
+        if (lag != 0 && std::abs(sa) > autoMax) autoMax = std::abs(sa);
+        if (std::abs(sx) > crossMax) crossMax = std::abs(sx);
+    }
+    char buf[220];
+    std::snprintf(buf, sizeof(buf),
+        "PRN %d: auto peak = %d (lag 0), max sidelobe = %d;  max |cross| vs PRN %d = %d  ->  ~%.0f dB separation",
+        pa, L, autoMax, pb, crossMax, 20.0 * std::log10((double)L / (crossMax > 0 ? crossMax : 1)));
+    FcodeLbl->Caption = String(buf);
+}
+
+//===========================================================================
+// Inspector: Tracking Loops Lab  (uses cached epochs)
+//===========================================================================
+void __fastcall TMainForm::advTrackClick(TObject* Sender)
+{
+    if (!FAdvReady) { Status(L"Click Analyze first."); return; }
+    TForm* f = makeInspector(L"Tracking Loops Lab", 960, 700);
+
+    TLabel* l = new TLabel(f); l->Parent = f; l->SetBounds(12, 12, 36, 20); l->Caption = L"PRN:";
+    FtrkPrn = new TComboBox(f); FtrkPrn->Parent = f; FtrkPrn->SetBounds(50, 8, 80, 24); FtrkPrn->Style = csDropDownList;
+    advFillPrnCombo(FtrkPrn, false);
+    FtrkPrn->OnChange = advTrackChange;
+    FtrkLbl = new TLabel(f); FtrkLbl->Parent = f; FtrkLbl->SetBounds(150, 12, 790, 20); FtrkLbl->AutoSize = false;
+
+    FtrkIQ = new TChart(f); FtrkIQ->Parent = f; FtrkIQ->SetBounds(12, 44, 360, 320);
+    FtrkIQ->Anchors = TAnchors() << akLeft << akTop; FtrkIQ->View3D = false; FtrkIQ->Legend->Visible = false;
+    FtrkIQ->Title->Text->Text = L"Prompt I/Q constellation";
+    FtrkIQ->BottomAxis->Title->Caption = L"I (prompt)"; FtrkIQ->LeftAxis->Title->Caption = L"Q (prompt)";
+    TPointSeries* iq = new TPointSeries(FtrkIQ); FtrkIQ->AddSeries(iq);
+    iq->Pointer->Size = 1; iq->Pointer->Style = psCircle;
+
+    FtrkDisc = new TChart(f); FtrkDisc->Parent = f; FtrkDisc->SetBounds(380, 44, 566, 320);
+    FtrkDisc->Anchors = TAnchors() << akLeft << akTop << akRight; FtrkDisc->View3D = false;
+    FtrkDisc->Legend->Visible = true; FtrkDisc->Legend->Alignment = laBottom;
+    FtrkDisc->Title->Text->Text = L"Loop discriminators vs time";
+    FtrkDisc->BottomAxis->Title->Caption = L"epoch (ms)";
+    TFastLineSeries* pll = new TFastLineSeries(FtrkDisc); FtrkDisc->AddSeries(pll); pll->Title = L"PLL (cycles)";
+    TFastLineSeries* dll = new TFastLineSeries(FtrkDisc); FtrkDisc->AddSeries(dll); dll->Title = L"DLL (chips)";
+
+    FtrkObs = new TChart(f); FtrkObs->Parent = f; FtrkObs->SetBounds(12, 374, 934, 296);
+    FtrkObs->Anchors = TAnchors() << akLeft << akTop << akRight << akBottom; FtrkObs->View3D = false;
+    FtrkObs->Legend->Visible = true; FtrkObs->Legend->Alignment = laBottom;
+    FtrkObs->Title->Text->Text = L"Observables: Doppler (Hz, left)  /  C/N0 (dB-Hz, right)";
+    FtrkObs->BottomAxis->Title->Caption = L"epoch (ms)";
+    FtrkObs->LeftAxis->Title->Caption = L"Doppler (Hz)"; FtrkObs->RightAxis->Title->Caption = L"C/N0 (dB-Hz)";
+    TFastLineSeries* dop = new TFastLineSeries(FtrkObs); FtrkObs->AddSeries(dop); dop->Title = L"Doppler";
+    TFastLineSeries* cn0 = new TFastLineSeries(FtrkObs); FtrkObs->AddSeries(cn0); cn0->Title = L"C/N0"; cn0->VertAxis = aRightAxis;
+
+    advTrackChange(NULL);
+    f->Show();
+}
+//---------------------------------------------------------------------------
+void __fastcall TMainForm::advTrackChange(TObject* Sender)
+{
+    if (!FtrkIQ || !FtrkDisc || !FtrkObs) return;
+    const AdvPrn* a = advFind(comboPrn(FtrkPrn));
+    if (!a) return;
+    const std::vector<gps::TrackEpoch>& ep = a->epochs;
+    const int N = (int)ep.size();
+
+    TChartSeries* iq = FtrkIQ->Series[0]; iq->Clear();
+    const int s = (N > 50) ? 50 : 0;
+    const int stepIQ = std::max(1, (N - s) / 1500);
+    for (int i = s; i < N; i += stepIQ) iq->AddXY(ep[i].iP, ep[i].qP, L"", clNavy);
+
+    TChartSeries* pll = FtrkDisc->Series[0]; pll->Clear();
+    TChartSeries* dll = FtrkDisc->Series[1]; dll->Clear();
+    TChartSeries* dop = FtrkObs->Series[0]; dop->Clear();
+    TChartSeries* cn0 = FtrkObs->Series[1]; cn0->Clear();
+    const int stepT = std::max(1, N / 800);
+    for (int i = 0; i < N; i += stepT) {
+        pll->AddXY((double)i, ep[i].pllDisc, L"", clTeeColor);
+        dll->AddXY((double)i, ep[i].dllDisc, L"", clTeeColor);
+        dop->AddXY((double)i, ep[i].doppler, L"", clTeeColor);
+        cn0->AddXY((double)i, ep[i].cn0,     L"", clTeeColor);
+    }
+    char b[240];
+    std::snprintf(b, sizeof(b),
+        "PRN %d: %d ms tracked, mean Doppler %+.0f Hz, C/N0 ~%.1f dB-Hz.  Two I/Q clusters = carrier-locked BPSK "
+        "(prompt-I sign = the 50 bps nav bits); the discriminators settle to noise around zero.",
+        a->prn, N, a->doppler, a->cn0);
+    FtrkLbl->Caption = String(b);
+}
+
+//===========================================================================
+// Inspector: Nav Frame & Bits  (uses cached NavDetail)
+//===========================================================================
+void __fastcall TMainForm::advNavClick(TObject* Sender)
+{
+    if (!FAdvReady) { Status(L"Click Analyze first."); return; }
+    TForm* f = makeInspector(L"Nav Frame & Bits", 960, 700);
+
+    TLabel* l = new TLabel(f); l->Parent = f; l->SetBounds(12, 12, 36, 20); l->Caption = L"PRN:";
+    FnavPrn = new TComboBox(f); FnavPrn->Parent = f; FnavPrn->SetBounds(50, 8, 80, 24); FnavPrn->Style = csDropDownList;
+    advFillPrnCombo(FnavPrn, false);
+    FnavPrn->OnChange = advNavChange;
+
+    TLabel* l2 = new TLabel(f); l2->Parent = f; l2->SetBounds(12, 40, 460, 18);
+    l2->Caption = L"Parity-passing subframes:";
+    FnavSubs = new TStringGrid(f); FnavSubs->Parent = f; FnavSubs->SetBounds(12, 60, 470, 250);
+    FnavSubs->Anchors = TAnchors() << akLeft << akTop << akBottom;
+    FnavSubs->ColCount = 6; FnavSubs->FixedCols = 0; FnavSubs->RowCount = 2;
+    FnavSubs->Options = FnavSubs->Options << goRowSelect;
+
+    FnavWords = new TStringGrid(f); FnavWords->Parent = f; FnavWords->SetBounds(496, 60, 450, 250);
+    FnavWords->Anchors = TAnchors() << akLeft << akTop << akRight << akBottom;
+    FnavWords->ColCount = 4; FnavWords->FixedCols = 0; FnavWords->RowCount = 11;
+
+    TLabel* l3 = new TLabel(f); l3->Parent = f; l3->SetBounds(12, 320, 460, 18);
+    l3->Caption = L"Recovered bit stream (subframe boundaries marked):";
+    FnavDump = new TMemo(f); FnavDump->Parent = f; FnavDump->SetBounds(12, 340, 934, 330);
+    FnavDump->Anchors = TAnchors() << akLeft << akTop << akRight << akBottom;
+    FnavDump->ReadOnly = true; FnavDump->ScrollBars = ssBoth;
+    FnavDump->Font->Name = L"Consolas"; FnavDump->Font->Size = 9;
+
+    advNavChange(NULL);
+    f->Show();
+}
+//---------------------------------------------------------------------------
+void __fastcall TMainForm::advNavChange(TObject* Sender)
+{
+    if (!FnavSubs || !FnavWords || !FnavDump) return;
+    const AdvPrn* a = advFind(comboPrn(FnavPrn));
+    if (!a) return;
+    const gps::NavDetail& d = a->detail;
+
+    FnavSubs->RowCount = (int)d.subframes.size() + 1;
+    const wchar_t* hdr[6] = { L"SF", L"TOW", L"page", L"alert/AS", L"words OK", L"bit idx" };
+    for (int c = 0; c < 6; ++c) FnavSubs->Cells[c][0] = hdr[c];
+    for (std::size_t i = 0; i < d.subframes.size(); ++i) {
+        const gps::NavSubframe& s = d.subframes[i];
+        int okw = 0; for (int w = 0; w < 10; ++w) if (s.words[w].parityOk) ++okw;
+        char b[24];
+        FnavSubs->Cells[0][i + 1] = IntToStr(s.id);
+        FnavSubs->Cells[1][i + 1] = IntToStr(s.towCount);
+        FnavSubs->Cells[2][i + 1] = (s.id == 4 || s.id == 5) ? IntToStr(s.page) : String(L"-");
+        FnavSubs->Cells[3][i + 1] = String(s.alert ? L"A" : L"-") + (s.antiSpoof ? L"/AS" : L"/-");
+        std::snprintf(b, sizeof(b), "%d/10", okw); FnavSubs->Cells[4][i + 1] = String(b);
+        FnavSubs->Cells[5][i + 1] = IntToStr(s.bitIndex);
+    }
+
+    const wchar_t* wh[4] = { L"word", L"raw (hex)", L"data (hex)", L"parity" };
+    for (int c = 0; c < 4; ++c) FnavWords->Cells[c][0] = wh[c];
+    if (!d.subframes.empty()) {
+        const gps::NavSubframe& s = d.subframes[0];
+        for (int w = 0; w < 10; ++w) {
+            char b[16];
+            FnavWords->Cells[0][w + 1] = IntToStr(w + 1);
+            std::snprintf(b, sizeof(b), "%08X", s.words[w].raw);  FnavWords->Cells[1][w + 1] = String(b);
+            std::snprintf(b, sizeof(b), "%06X", s.words[w].data); FnavWords->Cells[2][w + 1] = String(b);
+            FnavWords->Cells[3][w + 1] = s.words[w].parityOk ? L"OK" : L"FAIL";
+        }
+    }
+
+    FnavDump->Lines->BeginUpdate();
+    FnavDump->Clear();
+    char hl[140];
+    std::snprintf(hl, sizeof(hl), "PRN %d  polarity=%s  parityFails=%d  subframes=%d  (preamble 0x8B; 30 bits/word, 10 words = 300-bit/6 s subframe)",
+                  a->prn, d.polarity ? "inverted" : "upright", d.totalParityFails, (int)d.subframes.size());
+    FnavDump->Lines->Add(String(hl));
+    for (std::size_t i = 0; i < d.subframes.size(); ++i) {
+        const gps::NavSubframe& s = d.subframes[i];
+        char sh[80];
+        std::snprintf(sh, sizeof(sh), "-- Subframe %d  TOW=%d  page=%d --", s.id, s.towCount, s.page);
+        FnavDump->Lines->Add(String(sh));
+        for (int w = 0; w < 10; ++w) {
+            String line = L"  w";
+            if (w + 1 < 10) line += L" ";
+            line += IntToStr(w + 1) + L" ";
+            std::uint32_t r = s.words[w].raw;
+            for (int bk = 29; bk >= 0; --bk) { line += ((r >> bk) & 1) ? L"1" : L"0"; if (bk % 6 == 0) line += L" "; }
+            line += s.words[w].parityOk ? L"OK" : L"FAIL";
+            FnavDump->Lines->Add(line);
+        }
+    }
+    FnavDump->Lines->EndUpdate();
+}
+
+//===========================================================================
+// Inspector: Ephemeris Decoder & SV Clock  (uses cached Ephemeris)
+//===========================================================================
+void __fastcall TMainForm::advEphClick(TObject* Sender)
+{
+    if (!FAdvReady) { Status(L"Click Analyze first."); return; }
+    TForm* f = makeInspector(L"Ephemeris Decoder & SV Clock", 960, 700);
+
+    TLabel* l = new TLabel(f); l->Parent = f; l->SetBounds(12, 12, 36, 20); l->Caption = L"PRN:";
+    FephPrn = new TComboBox(f); FephPrn->Parent = f; FephPrn->SetBounds(50, 8, 80, 24); FephPrn->Style = csDropDownList;
+    advFillPrnCombo(FephPrn, true);
+    FephPrn->OnChange = advEphChange;
+
+    FephGrid = new TStringGrid(f); FephGrid->Parent = f; FephGrid->SetBounds(12, 44, 934, 500);
+    FephGrid->Anchors = TAnchors() << akLeft << akTop << akRight << akBottom;
+    FephGrid->ColCount = 4; FephGrid->FixedCols = 0; FephGrid->RowCount = 2;
+    FephGrid->ColWidths[0] = 150; FephGrid->ColWidths[1] = 220; FephGrid->ColWidths[2] = 130; FephGrid->ColWidths[3] = 420;
+
+    FephMemo = new TMemo(f); FephMemo->Parent = f; FephMemo->SetBounds(12, 552, 934, 118);
+    FephMemo->Anchors = TAnchors() << akLeft << akRight << akBottom;
+    FephMemo->ReadOnly = true; FephMemo->Font->Name = L"Consolas"; FephMemo->Font->Size = 9;
+
+    advEphChange(NULL);
+    f->Show();
+}
+//---------------------------------------------------------------------------
+void __fastcall TMainForm::advEphChange(TObject* Sender)
+{
+    if (!FephGrid || !FephMemo) return;
+    const AdvPrn* a = advFind(comboPrn(FephPrn));
+    if (!a || !a->nav.eph.valid) return;
+    const gps::Ephemeris& e = a->nav.eph;
+
+    struct Row { const wchar_t* field; double val; const wchar_t* units; const wchar_t* meaning; };
+    Row rows[] = {
+        { L"WN",        (double)e.weekNumber, L"week",   L"GPS week number (mod 1024)" },
+        { L"IODC",      (double)e.iodc,       L"-",      L"Issue Of Data, Clock" },
+        { L"IODE",      (double)e.iode,       L"-",      L"Issue Of Data, Ephemeris (== IODC LSBs)" },
+        { L"toc",       e.toc,                L"s",      L"clock reference time of week" },
+        { L"af0",       e.af0,                L"s",      L"SV clock bias" },
+        { L"af1",       e.af1,                L"s/s",    L"SV clock drift" },
+        { L"af2",       e.af2,                L"s/s^2",  L"SV clock drift rate" },
+        { L"TGD",       e.tgd,                L"s",      L"group delay differential" },
+        { L"toe",       e.toe,                L"s",      L"ephemeris reference time of week" },
+        { L"sqrtA",     e.sqrtA,              L"sqrt(m)",L"square root of semi-major axis" },
+        { L"e",         e.ecc,                L"-",      L"orbit eccentricity" },
+        { L"M0",        e.m0,                 L"rad",    L"mean anomaly at toe" },
+        { L"deltaN",    e.deltaN,             L"rad/s",  L"mean motion correction" },
+        { L"Omega0",    e.omega0,             L"rad",    L"longitude of ascending node @ week start" },
+        { L"OmegaDot",  e.omegaDot,           L"rad/s",  L"rate of right ascension" },
+        { L"i0",        e.i0,                 L"rad",    L"inclination at toe" },
+        { L"IDOT",      e.idot,               L"rad/s",  L"rate of inclination" },
+        { L"omega",     e.omega,              L"rad",    L"argument of perigee" },
+        { L"Cuc",       e.cuc,                L"rad",    L"cos harmonic, arg of latitude" },
+        { L"Cus",       e.cus,                L"rad",    L"sin harmonic, arg of latitude" },
+        { L"Crc",       e.crc,                L"m",      L"cos harmonic, orbit radius" },
+        { L"Crs",       e.crs,                L"m",      L"sin harmonic, orbit radius" },
+        { L"Cic",       e.cic,                L"rad",    L"cos harmonic, inclination" },
+        { L"Cis",       e.cis,                L"rad",    L"sin harmonic, inclination" },
+    };
+    const int nr = (int)(sizeof(rows) / sizeof(rows[0]));
+    FephGrid->RowCount = nr + 1;
+    FephGrid->Cells[0][0] = L"Field"; FephGrid->Cells[1][0] = L"Value";
+    FephGrid->Cells[2][0] = L"Units"; FephGrid->Cells[3][0] = L"Meaning";
+    for (int i = 0; i < nr; ++i) {
+        char v[40];
+        std::snprintf(v, sizeof(v), "%.10g", rows[i].val);
+        FephGrid->Cells[0][i + 1] = rows[i].field;
+        FephGrid->Cells[1][i + 1] = String(v);
+        FephGrid->Cells[2][i + 1] = rows[i].units;
+        FephGrid->Cells[3][i + 1] = rows[i].meaning;
+    }
+
+    const double a_m = e.sqrtA * e.sqrtA;
+    const double PI = 3.14159265358979;
+    FephMemo->Lines->BeginUpdate(); FephMemo->Clear();
+    char b[180];
+    std::snprintf(b, sizeof(b), "Derived:  a = sqrtA^2 = %.1f m (%.1f km),  i0 = %.2f deg,  Omega0 = %.2f deg,  period ~ %.0f min",
+                  a_m, a_m / 1e3, e.i0 * 180.0 / PI, e.omega0 * 180.0 / PI,
+                  2.0 * PI * std::sqrt(a_m * a_m * a_m / 3.986005e14) / 60.0);
+    FephMemo->Lines->Add(String(b));
+    std::snprintf(b, sizeof(b), "Sanity: e<0.03? %s   sqrtA~5153? %s   i0~0.97rad? %s   IODE==IODC&0xFF? %s",
+                  (e.ecc >= 0 && e.ecc < 0.03) ? "yes" : "NO",
+                  (e.sqrtA > 5000 && e.sqrtA < 5300) ? "yes" : "NO",
+                  (e.i0 > 0.8 && e.i0 < 1.2) ? "yes" : "NO",
+                  (e.iode == (e.iodc & 0xFF)) ? "yes" : "NO");
+    FephMemo->Lines->Add(String(b));
+    FephMemo->Lines->Add(L"SV clock: dt_sv(t) = af0 + af1*(t-toc) + af2*(t-toc)^2 + relativistic - TGD.  "
+                         L"Each field is a scaled integer (2^-n) broadcast in subframes 1/2/3.");
+    FephMemo->Lines->EndUpdate();
+}
+
+//===========================================================================
+// Inspector: Almanac & SF4/5 Pages  (uses cached AlmanacSet)
+//===========================================================================
+void __fastcall TMainForm::advAlmClick(TObject* Sender)
+{
+    if (!FAdvReady) { Status(L"Click Analyze first."); return; }
+    TForm* f = makeInspector(L"Almanac & SF4/5 Pages", 940, 660);
+
+    TStringGrid* g = new TStringGrid(f); g->Parent = f; g->SetBounds(12, 12, 916, 420);
+    g->Anchors = TAnchors() << akLeft << akTop << akRight << akBottom;
+    g->ColCount = 8; g->FixedCols = 0; g->RowCount = 2;
+    const wchar_t* hdr[8] = { L"PRN", L"sqrtA", L"a (km)", L"e", L"i0 (deg)", L"OmegaDot", L"af0 (s)", L"health" };
+    int colw[8] = { 50, 90, 90, 100, 80, 110, 110, 60 };
+    for (int c = 0; c < 8; ++c) { g->Cells[c][0] = hdr[c]; g->ColWidths[c] = colw[c]; }
+    int row = 0;
+    for (int prn = 1; prn <= 32; ++prn) {
+        const gps::Almanac& a = FAdvAlmanac.alm[prn];
+        if (!a.valid) continue;
+        ++row; if (g->RowCount < row + 1) g->RowCount = row + 1;
+        char b[40];
+        g->Cells[0][row] = IntToStr(prn);
+        std::snprintf(b, sizeof(b), "%.3f", a.sqrtA);                 g->Cells[1][row] = String(b);
+        std::snprintf(b, sizeof(b), "%.1f", a.sqrtA * a.sqrtA / 1e3); g->Cells[2][row] = String(b);
+        std::snprintf(b, sizeof(b), "%.6f", a.ecc);                  g->Cells[3][row] = String(b);
+        std::snprintf(b, sizeof(b), "%.2f", a.i0 * 180.0 / 3.14159265); g->Cells[4][row] = String(b);
+        std::snprintf(b, sizeof(b), "%.3e", a.omegaDot);             g->Cells[5][row] = String(b);
+        std::snprintf(b, sizeof(b), "%.3e", a.af0);                  g->Cells[6][row] = String(b);
+        g->Cells[7][row] = IntToStr(a.health);
+    }
+
+    TMemo* m = new TMemo(f); m->Parent = f; m->SetBounds(12, 440, 916, 178);
+    m->Anchors = TAnchors() << akLeft << akRight << akBottom; m->ReadOnly = true;
+    m->Font->Name = L"Consolas"; m->Font->Size = 9;
+    m->Lines->BeginUpdate();
+    m->Lines->Add(L"Almanac = coarse, long-validity reduced ephemeris for the WHOLE constellation, carried across "
+                  L"subframe 4/5 pages (vs precise ~2 hr ephemeris for one SV). Used for fast cold-start aiding.");
+    String ps = L"Pages captured (SV-ID/page): ";
+    for (std::size_t i = 0; i < FAdvAlmanac.pagesSeen.size() && i < 40; ++i) ps += IntToStr(FAdvAlmanac.pagesSeen[i]) + L" ";
+    m->Lines->Add(ps);
+    String wnLine = L"Almanac ref week (WNa) = ";
+    wnLine += (FAdvAlmanac.refWeek >= 0) ? IntToStr(FAdvAlmanac.refWeek) : String(L"(not in this capture)");
+    wnLine += L".  Iono page: "; wnLine += FAdvAlmanac.haveIono ? L"yes" : L"no";
+    wnLine += L".  UTC page: ";   wnLine += FAdvAlmanac.haveUtc  ? L"yes" : L"no";
+    m->Lines->Add(wnLine);
+    if (FAdvAlmanac.haveIono) {
+        char b[160];
+        std::snprintf(b, sizeof(b), "Klobuchar alpha: %.3e %.3e %.3e %.3e   beta: %.0f %.0f %.0f %.0f",
+                      FAdvAlmanac.alpha[0], FAdvAlmanac.alpha[1], FAdvAlmanac.alpha[2], FAdvAlmanac.alpha[3],
+                      FAdvAlmanac.beta[0], FAdvAlmanac.beta[1], FAdvAlmanac.beta[2], FAdvAlmanac.beta[3]);
+        m->Lines->Add(String(b));
+    }
+    m->Lines->Add(L"NOTE: the full almanac (all 32 PRNs + iono/UTC) spans the 25-page cycle = 12.5 minutes, so a "
+                  L"short capture only shows the few pages it contains - which is why almanac download is slow.");
+    m->Lines->EndUpdate();
+    f->Show();
+}
+
+//===========================================================================
+// Inspector: PVT Solver Lab  (uses cached fix)
+//===========================================================================
+void __fastcall TMainForm::advPvtClick(TObject* Sender)
+{
+    if (!FAdvReady)  { Status(L"Click Analyze first."); return; }
+    if (!FAdvFix.ok) { Status(L"No position fix in the cached analysis (need >= 4 satellites)."); return; }
+    TForm* f = makeInspector(L"PVT Solver Lab", 940, 640);
+
+    TStringGrid* g = new TStringGrid(f); g->Parent = f; g->SetBounds(12, 12, 916, 360);
+    g->Anchors = TAnchors() << akLeft << akTop << akRight << akBottom;
+    g->ColCount = 7; g->FixedCols = 0; g->RowCount = (int)FAdvFix.rows.size() + 1;
+    const wchar_t* hdr[7] = { L"PRN", L"pseudorange (km)", L"SV X (km)", L"SV Y (km)", L"SV Z (km)", L"SV clk (us)", L"elev (deg)" };
+    int colw[7] = { 50, 150, 130, 130, 130, 110, 90 };
+    for (int c = 0; c < 7; ++c) { g->Cells[c][0] = hdr[c]; g->ColWidths[c] = colw[c]; }
+    for (std::size_t i = 0; i < FAdvFix.rows.size(); ++i) {
+        const GuiSatRow& r = FAdvFix.rows[i];
+        char b[40]; const int row = (int)i + 1;
+        g->Cells[0][row] = IntToStr(r.prn);
+        std::snprintf(b, sizeof(b), "%.3f", r.prKm);     g->Cells[1][row] = String(b);
+        std::snprintf(b, sizeof(b), "%.0f", r.x);        g->Cells[2][row] = String(b);
+        std::snprintf(b, sizeof(b), "%.0f", r.y);        g->Cells[3][row] = String(b);
+        std::snprintf(b, sizeof(b), "%.0f", r.z);        g->Cells[4][row] = String(b);
+        std::snprintf(b, sizeof(b), "%+.3f", r.svClkUs); g->Cells[5][row] = String(b);
+        std::snprintf(b, sizeof(b), "%.1f", r.elDeg);    g->Cells[6][row] = String(b);
+    }
+
+    TMemo* m = new TMemo(f); m->Parent = f; m->SetBounds(12, 380, 916, 218);
+    m->Anchors = TAnchors() << akLeft << akRight << akBottom; m->ReadOnly = true;
+    m->Font->Name = L"Consolas"; m->Font->Size = 9;
+    m->Lines->BeginUpdate();
+    char b[180];
+    std::snprintf(b, sizeof(b), "FIX: Lat %.6f deg, Lon %.6f deg, Alt %.1f m   (ECEF %.1f, %.1f, %.1f m)",
+                  FAdvFix.lat, FAdvFix.lon, FAdvFix.alt, FAdvFix.x, FAdvFix.y, FAdvFix.z);
+    m->Lines->Add(String(b));
+    std::snprintf(b, sizeof(b), "GDOP %.2f   iterations %d   residual RMS %.1f m   Rx clock bias %.1f m (%.3f us)",
+                  FAdvFix.gdop, FAdvFix.iterations, FAdvFix.residRms, FAdvFix.clockBiasM, FAdvFix.clockBiasM / 299792458.0 * 1e6);
+    m->Lines->Add(String(b));
+    m->Lines->Add(L"");
+    m->Lines->Add(L"Pseudorange = (code phase + bit/subframe TOW) -> common-TOW alignment + 68.802 ms nominal travel,");
+    m->Lines->Add(L"x c. It is 'pseudo' because every range shares the receiver clock bias = the 4th unknown, so >= 4");
+    m->Lines->Add(L"satellites are needed. Gauss-Newton least squares solves [x,y,z,clk] from Earth-centre in ~5-6 iters,");
+    m->Lines->Add(L"with each SV's clock (af0/1/2 + relativistic - TGD) and the Sagnac earth-rotation correction applied.");
+    m->Lines->EndUpdate();
+    f->Show();
+}
+
+//===========================================================================
+// Shared helper: read the first 'maxSamples' int8 IF samples of the open
+// capture (used by the signal-level inspectors that work without "Analyze").
+//===========================================================================
+bool TMainForm::advReadIF(std::vector<signed char>& out, int maxSamples)
+{
+    out.clear();
+    if (FFilePath.IsEmpty() || maxSamples <= 0) return false;
+    std::ifstream f(AnsiString(FFilePath).c_str(), std::ios::binary);
+    if (!f) return false;
+    out.resize((std::size_t)maxSamples);
+    f.read(reinterpret_cast<char*>(out.data()), (std::streamsize)maxSamples);
+    out.resize((std::size_t)f.gcount());
+    return !out.empty();
+}
+
+// Blue->cyan->green->yellow->red heat ramp for the correlation surface.
+static void heatColor(float v, unsigned char& r, unsigned char& g, unsigned char& b)
+{
+    if (v < 0) v = 0; if (v > 1) v = 1;
+    float x = v * 4.0f;
+    if (x < 1.0f)      { r = 0;                       g = 0;                       b = (unsigned char)(128 + 127 * x); }
+    else if (x < 2.0f) { r = 0;                       g = (unsigned char)(255 * (x - 1)); b = 255; }
+    else if (x < 3.0f) { r = (unsigned char)(255 * (x - 2)); g = 255;             b = (unsigned char)(255 * (3 - x)); }
+    else               { r = 255;                     g = (unsigned char)(255 * (4 - x)); b = 0; }
+}
+
+//===========================================================================
+// Inspector: Acquisition Search Surface  (one PRN, straight from the capture)
+//===========================================================================
+void __fastcall TMainForm::advAcqClick(TObject* Sender)
+{
+    if (FFilePath.IsEmpty()) { Status(L"Open a capture first (File > Open)."); return; }
+    TForm* f = makeInspector(L"Acquisition Search Surface", 984, 720);
+
+    TLabel* l = new TLabel(f); l->Parent = f; l->SetBounds(12, 12, 36, 20); l->Caption = L"PRN:";
+    FacqPrn = new TComboBox(f); FacqPrn->Parent = f; FacqPrn->SetBounds(50, 8, 90, 24); FacqPrn->Style = csDropDownList;
+    int defIdx = -1, cnt = 0;
+    for (int p = 1; p <= 32; ++p) {
+        FacqPrn->Items->AddObject(L"PRN " + IntToStr(p), (TObject*)(NativeInt)p);
+        if (defIdx < 0 && p <= 32 && FResults[p].found) defIdx = cnt;   // first acquired PRN
+        ++cnt;
+    }
+    FacqPrn->ItemIndex = (defIdx >= 0) ? defIdx : 0;
+    FacqPrn->OnChange = advAcqChange;
+
+    FacqLbl = new TLabel(f); FacqLbl->Parent = f; FacqLbl->SetBounds(150, 12, 820, 20); FacqLbl->AutoSize = false;
+
+    TLabel* hl = new TLabel(f); hl->Parent = f; hl->SetBounds(12, 38, 600, 16);
+    hl->Caption = L"Correlation surface  (x = code phase 0..1023 chips,  y = Doppler high->low top->bottom,  bright = strong)";
+    FacqImg = new TImage(f); FacqImg->Parent = f; FacqImg->SetBounds(12, 56, 600, 362);
+    FacqImg->Stretch = true; FacqImg->Proportional = false;
+
+    FacqDop = new TChart(f); FacqDop->Parent = f; FacqDop->SetBounds(624, 56, 348, 362);
+    FacqDop->Anchors = TAnchors() << akLeft << akTop << akRight;
+    FacqDop->View3D = false; FacqDop->Legend->Visible = false;
+    FacqDop->Title->Text->Text = L"Doppler cut @ peak code phase";
+    FacqDop->BottomAxis->Title->Caption = L"Doppler (Hz)";
+    FacqDop->LeftAxis->Title->Caption = L"correlation (norm)";
+    TFastLineSeries* ds = new TFastLineSeries(FacqDop); FacqDop->AddSeries(ds);
+
+    FacqCode = new TChart(f); FacqCode->Parent = f; FacqCode->SetBounds(12, 430, 960, 172);
+    FacqCode->Anchors = TAnchors() << akLeft << akTop << akRight;
+    FacqCode->View3D = false; FacqCode->Legend->Visible = false;
+    FacqCode->Title->Text->Text = L"Code-phase cut @ peak Doppler  (the thumbtack)";
+    FacqCode->BottomAxis->Title->Caption = L"code phase (chips)";
+    FacqCode->LeftAxis->Title->Caption = L"correlation (norm)";
+    TFastLineSeries* csl = new TFastLineSeries(FacqCode); FacqCode->AddSeries(csl);
+
+    TMemo* m = new TMemo(f); m->Parent = f; m->SetBounds(12, 610, 960, 72);
+    m->Anchors = TAnchors() << akLeft << akRight << akBottom; m->ReadOnly = true;
+    m->Lines->Add(L"Parallel-code-phase search: for every Doppler trial the IF carrier is wiped off and ONE FFT circularly "
+                  L"correlates against the local C/A replica - testing all ~38192 code phases at once, swept over Doppler. "
+                  L"A satellite in view shows a sharp 2-D peak (its Doppler + code phase); an absent PRN shows only a flat "
+                  L"noise floor. Pick an acquired PRN, then an absent one, to see the difference.");
+    advAcqChange(NULL);
+    f->Show();
+}
+//---------------------------------------------------------------------------
+void __fastcall TMainForm::advAcqChange(TObject* Sender)
+{
+    if (!FacqImg || !FacqCode || !FacqDop) return;
+    int prn = comboPrn(FacqPrn); if (prn < 1) prn = 1;
+
+    gps::AcqConfig cfg = configForFile(FFilePath);
+    const int n = (int)std::lround(cfg.fs * 1.0e-3);
+    std::vector<signed char> raw;
+    if (!advReadIF(raw, n * cfg.numMs + 64) || (int)raw.size() < n * cfg.numMs) {
+        FacqLbl->Caption = L"Could not read enough samples from the capture."; return;
+    }
+
+    Screen->Cursor = crHourGlass;
+    gps::AcqSurface s;
+    bool okSurf = true;
+    try { s = gps::acquireSurface(prn, raw.data(), raw.size(), cfg, 512); }
+    catch (...) { okSurf = false; }
+    Screen->Cursor = crDefault;
+    if (!okSurf || s.nBins <= 0 || s.nCols <= 0) { FacqLbl->Caption = L"Surface computation failed."; return; }
+
+    // --- heatmap: rows = Doppler (high at top), cols = code phase ---
+    std::unique_ptr<Graphics::TBitmap> bmp(new Graphics::TBitmap());
+    bmp->PixelFormat = pf32bit;
+    bmp->Width  = s.nCols;
+    bmp->Height = s.nBins;
+    for (int y = 0; y < s.nBins; ++y) {
+        int srcBin = s.nBins - 1 - y;                 // flip so +Doppler is at top
+        unsigned char* line = (unsigned char*)bmp->ScanLine[y];
+        const float* row = &s.mag[(std::size_t)srcBin * s.nCols];
+        for (int x = 0; x < s.nCols; ++x) {
+            unsigned char r, g, b; heatColor(row[x], r, g, b);
+            line[x * 4 + 0] = b; line[x * 4 + 1] = g; line[x * 4 + 2] = r; line[x * 4 + 3] = 255;
+        }
+    }
+    FacqImg->Picture->Bitmap->Assign(bmp.get());
+
+    TChartSeries* csl = FacqCode->Series[0]; csl->Clear();
+    for (int c = 0; c < s.nCols; ++c) csl->AddXY(s.codeChips[c], s.codeSlice[c], L"", clNavy);
+    TChartSeries* ds = FacqDop->Series[0]; ds->Clear();
+    for (int b = 0; b < s.nBins; ++b) ds->AddXY(s.dopplerHz[b], s.dopplerSlice[b], L"", clNavy);
+
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+        "PRN %d: peak Doppler %+.0f Hz, code phase %.1f chips, peak/2nd-peak ratio %.1f  ->  %s",
+        prn, s.peakDopplerHz, s.peakCodeChip, s.peakRatio,
+        (s.peakRatio >= cfg.threshold ? "ACQUIRED (clear thumbtack peak)"
+                                      : "no clear peak (PRN likely not in view)"));
+    FacqLbl->Caption = String(buf);
+}
+
+//===========================================================================
+// Inspector: RF & Spectrum  (raw IF time series + Welch PSD, from the capture)
+//===========================================================================
+void __fastcall TMainForm::advRfClick(TObject* Sender)
+{
+    if (FFilePath.IsEmpty()) { Status(L"Open a capture first (File > Open)."); return; }
+    gps::AcqConfig cfg = configForFile(FFilePath);
+
+    const int L   = 4096;                 // Welch segment length (power of two)
+    const int K   = 16;                   // segments
+    const int hop = L / 2;                // 50% overlap
+    const int need = (K - 1) * hop + L;   // samples required
+    std::vector<signed char> raw;
+    if (!advReadIF(raw, need + 64) || (int)raw.size() < need) {
+        Status(L"Capture too short for a spectrum."); return;
+    }
+
+    TForm* f = makeInspector(L"RF & Spectrum", 968, 688);
+
+    TChart* ct = new TChart(f); ct->Parent = f; ct->SetBounds(12, 12, 944, 244);
+    ct->Anchors = TAnchors() << akLeft << akTop << akRight;
+    ct->View3D = false; ct->Legend->Visible = false;
+    ct->Title->Text->Text = L"Raw IF samples (first 600) - looks like noise";
+    ct->BottomAxis->Title->Caption = L"sample index";
+    ct->LeftAxis->Title->Caption = L"int8 amplitude";
+    TFastLineSeries* ts = new TFastLineSeries(ct); ct->AddSeries(ts);
+    for (int i = 0; i < 600 && i < (int)raw.size(); ++i) ts->AddXY((double)i, (double)raw[i], L"", clNavy);
+    FrfTime = ct;
+
+    TChart* cp = new TChart(f); cp->Parent = f; cp->SetBounds(12, 264, 944, 318);
+    cp->Anchors = TAnchors() << akLeft << akTop << akRight << akBottom;
+    cp->View3D = false; cp->Legend->Visible = true; cp->Legend->Alignment = laBottom;
+    cp->Title->Text->Text = L"Power spectral density (Welch, Hann window, 16 averages)";
+    cp->BottomAxis->Title->Caption = L"frequency (MHz)";
+    cp->LeftAxis->Title->Caption = L"power (dB)";
+    TFastLineSeries* ps = new TFastLineSeries(cp); cp->AddSeries(ps); ps->Title = L"PSD";
+    TLineSeries* ifm = new TLineSeries(cp); cp->AddSeries(ifm); ifm->Title = L"IF"; ifm->Color = clRed;
+    FrfPsd = cp;
+
+    // --- Welch PSD ---
+    const double TWO_PI = 6.283185307179586;
+    std::vector<double> win(L); double winPow = 0.0;
+    for (int i = 0; i < L; ++i) { win[i] = 0.5 - 0.5 * std::cos(TWO_PI * i / (L - 1)); winPow += win[i] * win[i]; }
+    double mean = 0.0; for (int i = 0; i < need; ++i) mean += raw[i]; mean /= need;
+
+    std::vector<double> psd((std::size_t)(L / 2), 0.0);
+    std::vector<dsp::cd> seg((std::size_t)L);
+    for (int sgi = 0; sgi < K; ++sgi) {
+        const int base = sgi * hop;
+        for (int i = 0; i < L; ++i) seg[i] = dsp::cd(((double)raw[base + i] - mean) * win[i], 0.0);
+        dsp::Fft::transform(seg, false);
+        for (int k = 0; k < L / 2; ++k) psd[k] += std::norm(seg[k]);
+    }
+    double pmax = -1e300, pmin = 1e300;
+    const double scale = 1.0 / ((double)K * (double)L * winPow + 1e-12);
+    for (int k = 1; k < L / 2; ++k) {
+        double db = 10.0 * std::log10(psd[k] * scale + 1e-12);
+        double fMHz = (double)k * cfg.fs / L / 1.0e6;
+        ps->AddXY(fMHz, db, L"", clNavy);
+        if (db > pmax) pmax = db; if (db < pmin) pmin = db;
+    }
+    // vertical IF marker
+    const double ifMHz = cfg.ifFreq / 1.0e6;
+    ifm->AddXY(ifMHz, pmin, L"", clRed);
+    ifm->AddXY(ifMHz, pmax, L"", clRed);
+
+    TMemo* m = new TMemo(f); m->Parent = f; m->SetBounds(12, 590, 944, 90);
+    m->Anchors = TAnchors() << akLeft << akRight << akBottom; m->ReadOnly = true;
+    char b[200];
+    std::snprintf(b, sizeof(b),
+        "Sampled at fs = %.3f MHz; the C/A signal sits at IF = %.3f MHz (red line) - but ~16 dB BELOW the noise floor,",
+        cfg.fs / 1.0e6, cfg.ifFreq / 1.0e6);
+    m->Lines->Add(String(b));
+    m->Lines->Add(L"so the spectrum is just band-limited noise with NO visible carrier. That is normal for GPS: the signal");
+    m->Lines->Add(L"arrives weaker than the thermal noise. Only the ~30 dB processing gain from despreading (correlating");
+    m->Lines->Add(L"against the 1.023 Mcps PRN code) lifts it out - exactly what the Acquisition Surface & C/A Code labs show.");
+    f->Show();
+}
+
+//===========================================================================
+// Inspector: Signal Journey Overview  (teaching flow + glossary, no data)
+//===========================================================================
+void __fastcall TMainForm::advJourneyClick(TObject* Sender)
+{
+    TForm* f = makeInspector(L"Signal Journey - from sky to fix", 1000, 720);
+
+    TLabel* hdr = new TLabel(f); hdr->Parent = f; hdr->SetBounds(12, 8, 970, 22);
+    hdr->Font->Style = TFontStyles() << fsBold; hdr->Font->Size = 11;
+    hdr->Caption = L"How a GPS fix is made - the journey of one satellite's signal (follow 1 -> 8)";
+
+    auto box = [&](int x, int y, const String& title, const String& sub) {
+        TPanel* p = new TPanel(f); p->Parent = f; p->SetBounds(x, y, 220, 74);
+        p->BevelOuter = bvRaised; p->ParentBackground = false; p->Color = (TColor)0x00EAF2F2;
+        TLabel* t = new TLabel(p); t->Parent = p; t->SetBounds(8, 6, 204, 16);
+        t->Caption = title; t->Font->Style = TFontStyles() << fsBold; t->Transparent = true;
+        t->ShowAccelChar = false;
+        TLabel* su = new TLabel(p); su->Parent = p; su->SetBounds(8, 26, 204, 44);
+        su->Caption = sub; su->WordWrap = true; su->AutoSize = false; su->Font->Size = 8; su->Transparent = true;
+    };
+    auto arrow = [&](int x, int y, const String& a) {
+        TLabel* l = new TLabel(f); l->Parent = f; l->SetBounds(x, y, 26, 26);
+        l->Caption = a; l->Font->Size = 16; l->Font->Style = TFontStyles() << fsBold; l->Font->Color = clNavy;
+    };
+
+    const int xs[4] = { 12, 252, 492, 732 };
+    const int y1 = 40, y2 = 156;
+    // Row 1 (left -> right): stages 1..4
+    box(xs[0], y1, L"1. Antenna / RF front-end", L"L1 1575.42 MHz down-converted to IF 9.55 MHz, sampled 38.192 Msps as int8.");
+    box(xs[1], y1, L"2. Acquisition",            L"FFT parallel-code-phase search -> which PRNs, coarse Doppler & code phase.");
+    box(xs[2], y1, L"3. Tracking",               L"Costas PLL (carrier) + DLL (code) lock and follow each satellite over time.");
+    box(xs[3], y1, L"4. Bit & Frame Sync",       L"20 ms -> 1 nav bit (50 bps); find the 0x8B preamble = subframe start.");
+    arrow(xs[0] + 222, y1 + 24, L"→");
+    arrow(xs[1] + 222, y1 + 24, L"→");
+    arrow(xs[2] + 222, y1 + 24, L"→");
+    arrow(xs[3] + 96,  y1 + 78, L"↓");      // down from stage 4 to stage 5
+    // Row 2 (right -> left): stages 5..8 (snake)
+    box(xs[3], y2, L"5. Nav Decode (LNAV)",      L"Parity-check words; read TLM/HOW, ephemeris (SF1-3) and almanac (SF4-5).");
+    box(xs[2], y2, L"6. SV Position & Clock",    L"Kepler propagate ephemeris -> each satellite's ECEF position and clock.");
+    box(xs[1], y2, L"7. Pseudoranges",           L"Code phase + decoded TOW -> range to each SV on a common receiver clock.");
+    box(xs[0], y2, L"8. PVT Solve",              L"Least squares on >=4 ranges -> receiver X/Y/Z/clock -> Lat / Lon / Alt.");
+    arrow(xs[2] + 222, y2 + 24, L"←");
+    arrow(xs[1] + 222, y2 + 24, L"←");
+    arrow(xs[0] + 222, y2 + 24, L"←");
+
+    TMemo* g = new TMemo(f); g->Parent = f; g->SetBounds(12, 250, 970, 430);
+    g->Anchors = TAnchors() << akLeft << akTop << akRight << akBottom;
+    g->ReadOnly = true; g->ScrollBars = ssVertical; g->Font->Name = L"Segoe UI"; g->Font->Size = 9;
+    g->Lines->BeginUpdate();
+    g->Lines->Add(L"GLOSSARY - key ideas behind each stage (open the matching inspector to see it on the real capture):");
+    g->Lines->Add(L"");
+    g->Lines->Add(L"C/A code (Coarse/Acquisition): each satellite has a unique 1023-chip Gold code at 1.023 Mcps that");
+    g->Lines->Add(L"   repeats every 1 ms. Its sharp autocorrelation is the key to CDMA and to ~30 dB of processing gain.");
+    g->Lines->Add(L"Spreading / despreading: the 50 bps data is multiplied by the fast code (spread over ~2 MHz), burying it");
+    g->Lines->Add(L"   under the noise. Correlating against a local replica (despreading) collapses it back and lifts it out.");
+    g->Lines->Add(L"Doppler: satellite motion shifts the carrier by +/- ~5 kHz; acquisition searches Doppler x code phase.");
+    g->Lines->Add(L"Acquisition surface: a 2-D correlation map; a satellite in view is a single sharp peak (the thumbtack).");
+    g->Lines->Add(L"Tracking loops: the Costas PLL keeps the carrier wiped (insensitive to the 180-deg data flips); the DLL");
+    g->Lines->Add(L"   keeps the local code aligned to within a fraction of a chip. Locked I/Q forms two BPSK clusters.");
+    g->Lines->Add(L"C/N0: carrier-to-noise-density (dB-Hz); ~37-45 dB-Hz for a healthy GPS signal after despreading.");
+    g->Lines->Add(L"Nav message (LNAV): 50 bps, 30-bit words, 10 words/subframe (6 s), 5 subframes/frame (30 s),");
+    g->Lines->Add(L"   25 pages (12.5 min). Each word ends in 6 parity bits (IS-GPS-200 Hamming/XOR).");
+    g->Lines->Add(L"TLM / HOW: word 1 carries the 0x8B preamble (Telemetry); word 2 (Hand-Over Word) carries the TOW count.");
+    g->Lines->Add(L"Ephemeris (SF 1-3): precise Keplerian orbit + clock for THIS satellite, valid ~2 hours (IODE/IODC tag it).");
+    g->Lines->Add(L"Almanac (SF 4-5): coarse, long-life orbit for the WHOLE constellation - used for fast cold-start aiding.");
+    g->Lines->Add(L"Pseudorange: speed-of-light x signal travel time. 'Pseudo' because every range shares one unknown -");
+    g->Lines->Add(L"   the receiver clock bias - so a 4th satellite is needed to solve it alongside X, Y, Z.");
+    g->Lines->Add(L"PVT: Position-Velocity-Time. Gauss-Newton least squares on the pseudoranges, with SV clock and the");
+    g->Lines->Add(L"   Sagnac (earth-rotation) correction applied, converges in ~5-6 iterations to an ECEF position -> WGS-84.");
+    g->Lines->Add(L"GDOP: geometry dilution of precision - how satellite geometry amplifies range error into position error.");
+    g->Lines->EndUpdate();
+    f->Show();
 }
 //---------------------------------------------------------------------------

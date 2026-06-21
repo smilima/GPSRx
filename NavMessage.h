@@ -77,6 +77,74 @@ struct NavDecode {
 // ephemeris + clock parameters.
 NavDecode decodeNav(const std::vector<int>& bits, int prn);
 
+// --- Detailed inspection of the LNAV frame (for the Advanced "Nav message" view) ---
+
+// One 30-bit LNAV word, fully exposed for teaching/inspection.
+struct NavWord {
+    std::uint32_t raw = 0;      // 30 received bits D1..D30 (polarity-corrected), MSB first
+    std::uint32_t data = 0;     // 24 recovered source data bits d1..d24
+    bool          parityOk = false;
+};
+
+// One parity-passing subframe, with its 10 words and decoded TLM/HOW fields.
+struct NavSubframe {
+    int  bitIndex = 0;          // start bit in the demodulated stream
+    int  id       = 0;          // subframe ID (1..5)
+    int  towCount = 0;          // HOW 17-bit TOW count (next subframe leading edge)
+    int  page     = 0;          // SF4/5 SV-ID / page id (word-3 bits 63..68), 0 for SF1-3
+    bool alert    = false;      // HOW alert flag
+    bool antiSpoof= false;      // HOW anti-spoof flag
+    NavWord words[10];
+    int  recovered[300];        // recovered source bits (1-based field extraction)
+};
+
+struct NavDetail {
+    int polarity = -1;          // 0 upright, 1 inverted
+    int totalParityFails = 0;   // preamble candidates rejected on parity
+    std::vector<NavSubframe> subframes;
+};
+
+// Full bit/word/parity breakdown of every parity-passing subframe in the stream.
+NavDetail inspectNav(const std::vector<int>& bits, int prn);
+
+// --- Almanac (subframes 4 & 5) - reduced-precision, long-validity orbit data ---
+// NOTE: the full almanac (all PRNs + iono/UTC) spans the 25-page cycle = 12.5 min,
+// so a short capture yields only the few pages it happens to contain.
+
+struct Almanac {
+    int    prn   = 0;
+    bool   valid = false;
+    double ecc=0;          // eccentricity (dimensionless)
+    double toa=0;          // almanac reference time (s)
+    double deltaI=0;       // inclination offset from 0.30 semicircles (rad)
+    double i0=0;           // inclination (rad) = (0.30 semicircles + deltaI)
+    double omegaDot=0;     // rate of right ascension (rad/s)
+    double sqrtA=0;        // sqrt semi-major axis (sqrt m)
+    double omega0=0;       // longitude of ascending node (rad)
+    double omega=0;        // argument of perigee (rad)
+    double m0=0;           // mean anomaly (rad)
+    double af0=0, af1=0;   // SV clock (s, s/s)
+    int    health=0;       // 8-bit SV health
+};
+
+struct AlmanacSet {
+    int    refWeek = -1;   // WNa almanac reference week (from page 25), -1 if not captured
+    double refToa  = -1;   // toa from page 25 (s), -1 if not captured
+    Almanac alm[33];       // per-PRN (index = PRN 1..32)
+    int    svHealth[33];   // health from the page-25 health pages (-1 = unknown)
+    // Subframe 4 page 18: ionosphere (Klobuchar) + UTC parameters.
+    bool   haveIono = false;
+    double alpha[4] = {0,0,0,0};   // Klobuchar alpha (s, s/semicircle, ...)
+    double beta[4]  = {0,0,0,0};   // Klobuchar beta
+    bool   haveUtc = false;
+    double utcA0=0, utcA1=0;       // UTC offset polynomial
+    int    utcTot=0, utcWNt=0, utcDtLS=0;
+    std::vector<int> pagesSeen;    // SV-ID/page ids actually captured (for teaching the 12.5 min cycle)
+};
+
+// Decode whatever subframe 4/5 almanac/health/iono/UTC pages are present in the stream.
+AlmanacSet decodeAlmanac(const std::vector<int>& bits);
+
 } // namespace gps
 
 #endif

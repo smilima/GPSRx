@@ -46,6 +46,31 @@ struct AcqResult {
 AcqResult acquireOne(int prn, const int8_t* signal, std::size_t signalLen,
                      const AcqConfig& cfg);
 
+// Full 2-D acquisition search surface for ONE PRN: the non-coherent correlation
+// magnitude over every Doppler bin x code phase. This is the data behind the
+// iconic "thumbtack" peak. The code-phase axis is down-sampled to 'nCols'
+// columns (max within each column) so a present satellite's 1-chip-wide spike
+// always survives. All magnitudes are normalised to the surface peak (0..1).
+struct AcqSurface {
+    int    prn   = 0;
+    int    nBins = 0;                 // Doppler rows
+    int    nCols = 0;                 // code-phase columns
+    std::vector<double> dopplerHz;    // nBins  : Doppler of each row (Hz)
+    std::vector<double> codeChips;    // nCols  : code phase of each column (chips)
+    std::vector<float>  mag;          // nBins*nCols, row-major, normalised 0..1
+    std::vector<float>  codeSlice;    // nCols  : the row through the peak Doppler
+    std::vector<float>  dopplerSlice; // nBins  : the column through the peak code phase
+    int    peakBin = 0, peakCol = 0;
+    double peakDopplerHz = 0.0;       // Doppler at the peak (Hz)
+    double peakCodeChip  = 0.0;       // code phase at the peak (chips)
+    double peakRatio     = 0.0;       // peak / strongest competing column (same row)
+};
+
+// Compute the search surface for 'prn'. 'signal' must hold >= numMs 1 ms records
+// starting at the capture origin (same buffer acquireAll uses).
+AcqSurface acquireSurface(int prn, const int8_t* signal, std::size_t signalLen,
+                          const AcqConfig& cfg, int nCols = 512);
+
 // Acquire PRNs 1..32. 'progress' (optional) is called as each PRN completes.
 std::vector<AcqResult> acquireAll(const int8_t* signal, std::size_t signalLen,
                                   const AcqConfig& cfg,
