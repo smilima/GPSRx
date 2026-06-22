@@ -159,6 +159,92 @@ AcqResult acquireOne(int prn, const int8_t* signal, std::size_t signalLen,
     return acquirePrnImpl(prn, spectra, plan, n, cfg.numMs, nBins, cfg);
 }
 
+AcqSurface acquireSurface(int prn, const int8_t* signal, std::size_t signalLen,
+                          const AcqConfig& cfg, int nCols)
+{
+    const int n = samplesPerCode(cfg.fs);
+    const int nBins = (int)std::lround((cfg.dopplerMax - cfg.dopplerMin) / cfg.dopplerStep) + 1;
+    if (nCols < 1)  nCols = 1;
+    if (nCols > n)  nCols = n;
+
+    dsp::BluesteinFft plan(n);
+    auto blocks   = makeBlocks(signal, signalLen, n, cfg.numMs);
+    auto carriers = makeCarriers(cfg, n, nBins);
+    auto spectra  = makeBasebandSpectra(blocks, carriers, plan, n, cfg.numMs, nBins);
+
+    // Conjugated replica spectrum for the chosen PRN.
+    std::vector<int8_t> code = generateCACode(prn);
+    std::vector<double> codeSamp = sampleCACode(code, cfg.fs, n);
+    std::vector<cd> codeC(n), C;
+    for (int i = 0; i < n; ++i) codeC[i] = cd(codeSamp[i], 0.0);
+    plan.forward(codeC, C);
+    for (int i = 0; i < n; ++i) C[i] = std::conj(C[i]);
+
+    const double sampPerChip = cfg.fs / CA_CHIP_RATE;
+
+    AcqSurface s;
+    s.prn = prn; s.nBins = nBins; s.nCols = nCols;
+    s.dopplerHz.resize(nBins);
+    s.codeChips.resize(nCols);
+    s.mag.assign((std::size_t)nBins * nCols, 0.0f);
+    for (int c = 0; c < nCols; ++c)
+        s.codeChips[c] = ((double)c / nCols) * ((double)n / sampPerChip); // 0..1023
+
+    std::vector<cd> prod(n), corr;
+    std::vector<double> acc(n);
+    std::vector<int>    binPeakIdx(nBins, 0);
+    double globalPeak = -1.0;
+    int    peakBin = 0, peakPhase = 0;
+
+    for (int b = 0; b < nBins; ++b) {
+        s.dopplerHz[b] = cfg.dopplerMin + b * cfg.dopplerStep;
+        std::fill(acc.begin(), acc.end(), 0.0);
+        for (int m = 0; m < cfg.numMs; ++m) {
+            const std::vector<cd>& B = spectra[(std::size_t)b * cfg.numMs + m];
+            for (int i = 0; i < n; ++i) prod[i] = B[i] * C[i];
+            plan.inverse(prod, corr);
+            for (int i = 0; i < n; ++i) acc[i] += std::norm(corr[i]);
+        }
+        int idxPeak = 0; double valPeak = -1.0;
+        float* row = &s.mag[(std::size_t)b * nCols];
+        for (int i = 0; i < n; ++i) {
+            int c = (int)((long long)i * nCols / n);
+            if (c >= nCols) c = nCols - 1;
+            if ((float)acc[i] > row[c]) row[c] = (float)acc[i];   // max-pool into column
+            if (acc[i] > valPeak) { valPeak = acc[i]; idxPeak = i; }
+        }
+        binPeakIdx[b] = idxPeak;
+        if (valPeak > globalPeak) { globalPeak = valPeak; peakBin = b; peakPhase = idxPeak; }
+    }
+
+    s.peakBin       = peakBin;
+    s.peakCol       = (int)((long long)peakPhase * nCols / n);
+    s.peakDopplerHz = cfg.dopplerMin + peakBin * cfg.dopplerStep;
+    s.peakCodeChip  = peakPhase / sampPerChip;
+
+    // Peak/second-peak ratio along the winning Doppler row (code domain), with a
+    // small guard either side of the peak column.
+    {
+        const float* row = &s.mag[(std::size_t)peakBin * nCols];
+        const int guard = std::max(1, (int)std::ceil(sampPerChip * nCols / n));
+        double second = 0.0;
+        for (int c = 0; c < nCols; ++c) {
+            if (std::abs(c - s.peakCol) <= guard) continue;
+            if (row[c] > second) second = row[c];
+        }
+        s.peakRatio = (second > 0.0) ? (globalPeak / second) : 0.0;
+    }
+
+    // Normalise the surface and pull the two slices through the peak.
+    const float inv = (globalPeak > 0.0) ? (float)(1.0 / globalPeak) : 1.0f;
+    for (std::size_t i = 0; i < s.mag.size(); ++i) s.mag[i] *= inv;
+    s.codeSlice.resize(nCols);
+    for (int c = 0; c < nCols; ++c) s.codeSlice[c] = s.mag[(std::size_t)peakBin * nCols + c];
+    s.dopplerSlice.resize(nBins);
+    for (int b = 0; b < nBins; ++b) s.dopplerSlice[b] = s.mag[(std::size_t)b * nCols + s.peakCol];
+    return s;
+}
+
 double refineDoppler(const std::int8_t* sig, std::size_t len, int prn,
                      double coarseDoppler, const AcqConfig& cfg,
                      double rangeHz, double stepHz, int numMs)
