@@ -210,11 +210,9 @@ object MainForm: TMainForm
       object Close2: TMenuItem
         Caption = '-'
       end
-      object Exit1: TMenuItem
-        Caption = 'Exit'
-      end
       object Exit2: TMenuItem
         Caption = 'Exit'
+        OnClick = Exit2Click
       end
     end
   end

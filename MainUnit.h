@@ -73,7 +73,6 @@ __published:	// IDE-managed Components
 	TMenuItem *File2;
 	TMenuItem *Close1;
 	TMenuItem *Close2;
-	TMenuItem *Exit1;
 	TMenuItem *Exit2;
 	TOpenDialog *OpenDialog1;
 	TSplitter *Splitter1;
@@ -96,6 +95,7 @@ __published:	// IDE-managed Components
 	void __fastcall sgChannelsSelectCell(TObject *Sender, System::LongInt ACol,
 	                                     System::LongInt ARow, bool &CanSelect);
 	void __fastcall btnFixClick(TObject *Sender);
+	void __fastcall Exit2Click(TObject *Sender);
 private:	// User declarations
 	String         FFilePath;        // full path of the loaded capture (name-only shown in editFile)
 	bool           FHaveResults;     // true once a sky search has populated the chart

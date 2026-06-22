@@ -1545,3 +1545,9 @@ __fastcall TMainForm::~TMainForm()
     if (FDeadStream) { delete FDeadStream; FDeadStream = NULL; }
 }
 //---------------------------------------------------------------------------
+void __fastcall TMainForm::Exit2Click(TObject *Sender)
+{
+	Close();
+}
+//---------------------------------------------------------------------------
+
