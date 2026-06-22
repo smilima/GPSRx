@@ -41,6 +41,9 @@ __recovery/
 *.il?
 *.#*
 
+# ---- MATLAB
+*.m
+
 # ---- Build / scratch logs ----
 *.log
 
